@@ -1,6 +1,5 @@
 transformers==4.52.0
 pytorch==2.5.1
-transformers==4.44.2
 trl==0.16.1
 
 accelerate

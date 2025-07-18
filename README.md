@@ -25,7 +25,9 @@ With the rapid evolution of multimodal large language models, the capacity to de
 </p>
 
 ## 🔥 News
-We are seeking self-motivated Research Interns and conducting Campus Recruitment in China. Please feel free to contact Tech Manager via WeChat (id: weixihan1)
+We are seeking self-motivated Research Interns and conducting Campus Recruitment in China. Please feel free to contact Tech Manager via E-mail (xihan.wxh AT alibaba-inc DOT com)
+
+[2025/07/18] Fixed some answers in file `src/open-r1-multimodal/data_config/Video-R1_rewrite.json`, sorry for these errors.
 
 [2025/07/01] We release training and evaluation codes, model weights, IntentBench, and training data in huggingface🤗 and modelscope🤖
 
