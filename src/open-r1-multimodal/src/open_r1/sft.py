@@ -274,7 +274,7 @@ class LazySupervisedDataset(Dataset):
                             ]
                     }]
         msg.append({
-            "role": "assitant",
+            "role": "assistant",
             "content": [
                 {
                     "type": "text",
