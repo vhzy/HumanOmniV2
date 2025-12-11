@@ -125,7 +125,24 @@ SYSTEM_PROMPT = (
 
 def main(script_args, training_args, model_args):
     # Get reward functions
-    reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
+    reward_funcs = []
+    for func_name in script_args.reward_funcs:
+        if func_name in reward_funcs_registry:
+            reward_funcs.append(reward_funcs_registry[func_name])
+        elif "." in func_name:
+            # Dynamically load reward function if it contains a dot (e.g., module.function)
+            import importlib
+            module_name, function_name = func_name.rsplit(".", 1)
+            try:
+                module = importlib.import_module(module_name)
+                reward_func = getattr(module, function_name)
+                reward_funcs.append(reward_func)
+                print(f"[GRPO] Successfully loaded custom reward function: {func_name}")
+            except Exception as e:
+                raise ValueError(f"Failed to load reward function '{func_name}': {e}")
+        else:
+            raise ValueError(f"Reward function '{func_name}' not found in registry or as a module path.")
+            
     print("reward_funcs:", reward_funcs)
 
     # Load the dataset
@@ -134,6 +151,9 @@ def main(script_args, training_args, model_args):
 
     # Format into conversation
     def make_conversation(example):
+        if "problem" not in example:
+            example["problem"] = "As an expert in the field of emotions, please focus on the facial expressions, body movements, tone, subtitle content, etc., in the video to discern clues related to the emotions of the individual. Please provide a detailed description and ultimately predict the emotional state of the individual in the video."
+        
         return {
             "prompt": [
                 {"role": "system", "content": SYSTEM_PROMPT},

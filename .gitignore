@@ -2,3 +2,26 @@
 output
 __pycache__
 *.DS_Store
+
+# 实验及运行产物
+wandb/
+affect_r1/extract_data
+src/open-r1-multimodal/wandb/
+**/wandb/
+*.log
+*.tmp
+
+# 体积大的数据/模型文件
+affect_r1/data/**/*.jsonl
+affect_r1/extract_data/**/*.jsonl
+affect_r1/emotion_wheel/*.xlsx
+affect_r1/emotion_wheel/*.jpg
+affect_r1/emotion_wheel/*.webp
+assets/*.png
+assets/*.jpg
+assets/*.webp
+*.npz
+*.ckpt
+*.pth
+*.pt
+*.bin

@@ -29,7 +29,6 @@ torchrun  --nproc_per_node 8 --nnodes=$WORLD_SIZE --node_rank=$RANK --master_add
     --model_name_or_path Qwen/Qwen2.5-Omni-7B-thinker \
     --dataset_name data_config/stage1.yaml \
     --freeze_vision_modules true \
-    --use_audio_in_video true \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 1 \
     --logging_steps 1 \

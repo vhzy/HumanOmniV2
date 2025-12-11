@@ -48,7 +48,7 @@ torchrun  --nproc_per_node 8 --nnodes=$WORLD_SIZE --node_rank=$RANK --master_add
     --use_audio_in_video true \
     --gradient_checkpointing true \
     --log_completions true \
-    --attn_implementation flash_attention_2 \
+    --attn_implementation eager \
     --num_train_epochs 1 \
     --run_name $RUN_NAME \
     --save_steps 100 \

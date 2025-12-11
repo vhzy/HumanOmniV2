@@ -26,8 +26,8 @@ import datasets
 from datasets import Dataset, IterableDataset
 from packaging import version
 from transformers import (
-    AriaForConditionalGeneration,
-    AriaProcessor,
+    # AriaForConditionalGeneration,
+    # AriaProcessor,
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     AutoProcessor,
@@ -35,8 +35,8 @@ from transformers import (
     GenerationConfig,
     PreTrainedModel,
     PreTrainedTokenizerBase,
-    Qwen2VLForConditionalGeneration,
-    Qwen2_5_VLForConditionalGeneration,
+    # Qwen2VLForConditionalGeneration,
+    # Qwen2_5_VLForConditionalGeneration,
     Trainer,
     TrainerCallback,
     is_wandb_available,
@@ -529,9 +529,53 @@ class VLMGRPOTrainer(Trainer):
             repetition_penalty=self.repetition_penalty,
             cache_implementation=args.cache_implementation,
         )
-        if hasattr(self.vlm_module, "get_eos_token_id"): # For InternVL
+        if hasattr(self.vlm_module, "get_eos_token_id"):  # For InternVL
             self.generation_config.eos_token_id = self.vlm_module.get_eos_token_id(processing_class)
             print(222, self.vlm_module.get_eos_token_id(processing_class))
+
+        # 禁止在 completion 中生成多模态占位符，避免二次 forward 时触发 Qwen Omni 的多模态解析错误
+        try:
+            tokenizer = getattr(processing_class, "tokenizer", processing_class)
+            bad_tokens = []
+
+            # 来自 tokenizer 的多模态特殊 token（如 <image> / <video> / <audio>）
+            for token_attr in ["image_token", "video_token", "audio_token"]:
+                token = getattr(tokenizer, token_attr, None)
+                if token is not None:
+                    tid = tokenizer.convert_tokens_to_ids(token)
+                    if tid is not None and tid != tokenizer.pad_token_id:
+                        bad_tokens.append([int(tid)])
+
+            # 来自模型 config 的多模态相关 token id / index
+            config = model.config
+            for cfg_attr in [
+                "vision_start_token_id",
+                "vision_end_token_id",
+                "vision_token_id",
+                "audio_start_token_id",
+                "audio_end_token_id",
+                "audio_token_id",
+                "image_token_id",
+                "audio_token_index",
+                "image_token_index",
+                "video_token_index",
+            ]:
+                if hasattr(config, cfg_attr):
+                    tid = getattr(config, cfg_attr)
+                    if tid is not None:
+                        bad_tokens.append([int(tid)])
+
+            if len(bad_tokens) > 0:
+                if self.generation_config.bad_words_ids is None:
+                    self.generation_config.bad_words_ids = bad_tokens
+                else:
+                    self.generation_config.bad_words_ids = (
+                        self.generation_config.bad_words_ids + bad_tokens
+                    )
+        except Exception:
+            # 如果构造 bad_words_ids 失败，不影响训练主体逻辑
+            pass
+
         self.beta = args.beta
         self.epsilon_low = args.epsilon
         self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
@@ -692,7 +736,8 @@ class VLMGRPOTrainer(Trainer):
         # print(inputs)
         prompts = [x["prompt"] for x in inputs]
         prompts_text = self.vlm_module.prepare_prompt(self.processing_class, inputs)[0]
-        use_audio_in_video = False #inputs[0].get("use_audio_in_video", False)
+        # print(f"[DEBUG] Rank {self.accelerator.process_index}: len(inputs)={len(inputs)}, len(prompts_text)={len(prompts_text)}")
+        use_audio_in_video = inputs[0].get("use_audio_in_video", False)
         # print(prompts_text)
         images, videos, audios = [], [], []
 
@@ -721,6 +766,17 @@ class VLMGRPOTrainer(Trainer):
             add_special_tokens=False,
             use_audio_in_video=use_audio_in_video,
         )
+        # Processor 未显式返回 audio_feature_lengths 时，仅在存在音频特征的前提下，
+        # 借助 feature_attention_mask 推导补全，避免无音频样本产生伪造的长度信息
+        if (
+            "input_features" in prompt_inputs
+            and prompt_inputs["input_features"] is not None
+            and "audio_feature_lengths" not in prompt_inputs
+            and "feature_attention_mask" in prompt_inputs
+        ):
+            fam = prompt_inputs["feature_attention_mask"]
+            input_lengths = (fam.sum(dim=1) - 1) // 2 + 1
+            prompt_inputs["audio_feature_lengths"] = (input_lengths - 2) // 2 + 1
         prompt_inputs = super()._prepare_inputs(prompt_inputs)
         prompt_inputs["use_audio_in_video"] = use_audio_in_video
 
@@ -743,7 +799,6 @@ class VLMGRPOTrainer(Trainer):
             prompt_length = prompt_ids.size(1)
             if not self.vlm_module.is_embeds_input():
                 prompt_completion_ids = generate_returned_result
-                prompt_ids = prompt_completion_ids[:, :prompt_length]
                 completion_ids = prompt_completion_ids[:, prompt_length:]
             else:
                 # In this case, the input of the LLM backbone is the embedding of the combination of the image and text prompt
@@ -764,36 +819,56 @@ class VLMGRPOTrainer(Trainer):
 
         # Get the multimodal inputs
         multimodal_keywords = self.vlm_module.get_custom_multimodal_keywords()
-        multimodal_inputs = {k: prompt_inputs[k] if k in prompt_inputs else None for k in multimodal_keywords}
-        with torch.no_grad():
-            # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip its
-            # computation here, and use per_token_logps.detach() instead.
-            if self.num_iterations > 1:
-                old_per_token_logps = self._get_per_token_logps(
-                    self.model, prompt_completion_ids, attention_mask, **multimodal_inputs
-                )
-                old_per_token_logps = old_per_token_logps[:, prompt_length - 1:]
-            else:
-                old_per_token_logps = None
-
-            if self.beta == 0.0:
-                ref_per_token_logps = None
-            elif self.ref_model is not None:
-                ref_per_token_logps = self._get_per_token_logps(
-                    self.ref_model, prompt_completion_ids, attention_mask, **multimodal_inputs
-                )
-                ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1:]
-            else:
-                with self.accelerator.unwrap_model(self.model).disable_adapter():
-                    ref_per_token_logps = self._get_per_token_logps(
+        # multimodal_inputs = {k: prompt_inputs[k] if k in prompt_inputs else None for k in multimodal_keywords}
+        excluded_keys = set()  # 保留全部多模态特征，避免音视频特征被丢弃
+        multimodal_inputs = {k: prompt_inputs[k] for k in multimodal_keywords if k in prompt_inputs and k not in excluded_keys}
+        try:
+            with torch.no_grad():
+                # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip its
+                # computation here, and use per_token_logps.detach() instead.
+                if self.num_iterations > 1:
+                    old_per_token_logps = self._get_per_token_logps(
                         self.model, prompt_completion_ids, attention_mask, **multimodal_inputs
                     )
-                ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1:]
+                    old_per_token_logps = old_per_token_logps[:, prompt_length - 1:]
+                else:
+                    old_per_token_logps = None
+
+                if self.beta == 0.0:
+                    ref_per_token_logps = None
+                elif self.ref_model is not None:
+                    ref_per_token_logps = self._get_per_token_logps(
+                        self.ref_model, prompt_completion_ids, attention_mask, **multimodal_inputs
+                    )
+                    ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1:]
+                else:
+                    with self.accelerator.unwrap_model(self.model).disable_adapter():
+                        ref_per_token_logps = self._get_per_token_logps(
+                            self.model, prompt_completion_ids, attention_mask, **multimodal_inputs
+                        )
+                    ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1:]
+        except Exception as e:
+            # Print problematic sample info for debugging
+            print(f"\n[Error] Exception during logit computation: {e}")
+            print(f"[Error] Failed inputs info:")
+            for i, example in enumerate(inputs):
+                print(f"--- Sample {i} ---")
+                if 'path' in example:
+                    print(f"Path: {example['path']}")
+                if 'audio_path' in example:
+                    print(f"Audio Path: {example.get('audio_path')}")
+                if 'prompt' in example:
+                    # Print first 200 chars of prompt or conversation
+                    prompt_preview = str(example['prompt'])[:200]
+                    print(f"Prompt preview: {prompt_preview}...")
+                
+            raise e
 
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         if is_conversational(inputs[0]):
             completions = [[{"role": "assistant", "content": completion}] for completion in completions_text]
+        # else branch intentionally omitted in official logic
 
         # Compute the rewards
         # No need to duplicate prompts as we're not generating multiple completions per prompt
@@ -939,9 +1014,17 @@ class VLMGRPOTrainer(Trainer):
         self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
 
         if self.log_completions and self.state.global_step % self.args.logging_steps == 0:
+            # Gather across processes so lengths对齐
             prompts_to_log = gather_object(prompts_text)
             completions_to_log = gather_object(completions_text)
-            rewards_to_log = rewards.tolist()
+            rewards_to_log = {"sum": rewards.tolist()}
+            for i, reward_func in enumerate(self.reward_funcs):
+                if isinstance(reward_func, nn.Module):
+                    reward_func_name = reward_func.config._name_or_path.split("/")[-1]
+                else:
+                    reward_func_name = reward_func.__name__
+                rewards_to_log[reward_func_name] = rewards_per_func[:, i].tolist()
+            advantages_to_log = gather_object(advantages.tolist())
             
             if self.accelerator.is_main_process:
                 if is_rich_available():
@@ -949,7 +1032,8 @@ class VLMGRPOTrainer(Trainer):
                         prompts_to_log,
                         completions_to_log,
                         rewards_to_log,
-                        self.state.global_step,
+                        advantages=advantages_to_log,
+                        step=self.state.global_step,
                     )
                 # if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
                 #     import pandas as pd
@@ -1123,7 +1207,7 @@ class VLMGRPOTrainer(Trainer):
 
         model_card.save(os.path.join(self.args.output_dir, "README.md"))
 
-    def _get_train_sampler(self) -> Sampler:
+    def _get_train_sampler(self, train_dataset: Optional[Dataset] = None) -> Sampler:
         """Returns a sampler that ensures proper data sampling for GRPO training."""
         effective_batch_size = (
             self.args.per_device_train_batch_size
@@ -1132,7 +1216,7 @@ class VLMGRPOTrainer(Trainer):
         )
         
         return RepeatRandomSampler(
-            data_source=self.train_dataset,
+            data_source=train_dataset if train_dataset is not None else self.train_dataset,
             mini_repeat_count=self.num_generations,
             batch_size=effective_batch_size // self.num_generations,
             repeat_count=self.num_iterations,

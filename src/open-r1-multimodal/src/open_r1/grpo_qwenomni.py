@@ -31,7 +31,7 @@ import pathlib
 
 from PIL import Image
 from torch.utils.data import Dataset
-from transformers import Qwen2VLForConditionalGeneration
+# from transformers import Qwen2VLForConditionalGeneration
 
 from math_verify import parse, verify
 from open_r1.trainer import VLMGRPOTrainer, GRPOConfig
@@ -49,12 +49,14 @@ from decord import VideoReader, cpu, AudioReader
 import numpy as np
 
 # ----------------------- Fix the flash attention bug in the current version of transformers -----------------------
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLVisionFlashAttention2, apply_rotary_pos_emb_flashatt, flash_attn_varlen_func
+# from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLVisionFlashAttention2, apply_rotary_pos_emb_flashatt, flash_attn_varlen_func
 import torch
 from typing import Tuple
 import copy
 from qwen_omni_utils import process_mm_info
 import av
+
+from open_r1.prompts import AFFECT_SYSTEM_PROMPT
 
 def check_if_video_has_audio(video_path):
     try:
@@ -72,43 +74,43 @@ logger = logging.getLogger(__name__)
 
 
 
-def custom_forward(
-        self,
-        hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        rotary_pos_emb: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        seq_length = hidden_states.shape[0]
-        q, k, v = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
-        # print(111, 222, 333, 444, 555, 666, 777, 888, 999)
-        if position_embeddings is None:
-            logger.warning_once(
-                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
-                "through `rotary_pos_emb` (2D tensor of RoPE theta values), to using externally computed "
-                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.54 `rotary_pos_emb` will be "
-                "removed and `position_embeddings` will be mandatory."
-            )
-            emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-            cos = emb.cos().float()
-            sin = emb.sin().float()
-        else:
-            cos, sin = position_embeddings
-            # Add this
-            cos = cos.to(torch.float)
-            sin = sin.to(torch.float)
-        q, k = apply_rotary_pos_emb_flashatt(q.unsqueeze(0), k.unsqueeze(0), cos, sin)
-        q = q.squeeze(0)
-        k = k.squeeze(0)
+# def custom_forward(
+#         self,
+#         hidden_states: torch.Tensor,
+#         cu_seqlens: torch.Tensor,
+#         rotary_pos_emb: Optional[torch.Tensor] = None,
+#         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+#     ) -> torch.Tensor:
+#         seq_length = hidden_states.shape[0]
+#         q, k, v = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+#         # print(111, 222, 333, 444, 555, 666, 777, 888, 999)
+#         if position_embeddings is None:
+#             logger.warning_once(
+#                 "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
+#                 "through `rotary_pos_emb` (2D tensor of RoPE theta values), to using externally computed "
+#                 "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.54 `rotary_pos_emb` will be "
+#                 "removed and `position_embeddings` will be mandatory."
+#             )
+#             emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+#             cos = emb.cos().float()
+#             sin = emb.sin().float()
+#         else:
+#             cos, sin = position_embeddings
+#             # Add this
+#             cos = cos.to(torch.float)
+#             sin = sin.to(torch.float)
+#         q, k = apply_rotary_pos_emb_flashatt(q.unsqueeze(0), k.unsqueeze(0), cos, sin)
+#         q = q.squeeze(0)
+#         k = k.squeeze(0)
 
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-        attn_output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(
-            seq_length, -1
-        )
-        attn_output = self.proj(attn_output)
-        return attn_output
+#         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+#         attn_output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(
+#             seq_length, -1
+#         )
+#         attn_output = self.proj(attn_output)
+#         return attn_output
 
-Qwen2_5_VLVisionFlashAttention2.forward = custom_forward
+# Qwen2_5_VLVisionFlashAttention2.forward = custom_forward
 
 
 # ----------------------- Main Script -----------------------
@@ -154,14 +156,6 @@ class GRPOModelConfig(ModelConfig):
 
 
 
-SYSTEM_PROMPT = """You are a helpful assistant. Your primary goal is to deeply analyze and interpret information from available various modalities (image, video, audio, text context) to answer questions with human-like depth and a clear, traceable thought process.
-
-Begin by thoroughly understanding the image, video, audio or other available context information, and then proceed with an in-depth analysis related to the question. 
-
-In reasoning, It is encouraged to incorporate self-reflection and verification into your reasoning process. You are encouraged to review the image, video, audio, or other context information to ensure the answer accuracy.
-
-Provide your understanding of the image, video, and audio between the <context> </context> tags, detail the reasoning between the <think> </think> tags, and then give your final answer between the <answer> </answer> tags.
-"""
 class LazySupervisedDataset(Dataset):
 
     TYPE_TEMPLATE = {
@@ -263,98 +257,131 @@ class LazySupervisedDataset(Dataset):
   
 
     def _make_conversation_image_and_video(self, example, use_audio_in_video=False):
-        if example["problem_type"] == 'multiple choice' or  example["problem_type"] == 'emer_ov_mc':
-            question = example['problem'] + " Options:\n"
-            for op in example["options"]:
+        if "problem" not in example or not example["problem"]:
+            example["problem"] = (
+                "As an expert in the field of emotions, please focus on the facial expressions, body movements, tone, "
+                "subtitle content, etc., in the video to discern clues related to the emotions of the individual. "
+                "Please provide a detailed description and ultimately predict the emotional state of the individual in the video."
+            )
+        if "problem_type" not in example:
+            example["problem_type"] = "emer_ov"
+        if "data_type" not in example:
+            example["data_type"] = "video"
+
+        if example["problem_type"] == "multiple choice" or example["problem_type"] == "emer_ov_mc":
+            question = example["problem"] + " Options:\n"
+            for op in example.get("options", []):
                 question += op + "\n"
         else:
-            question = example['problem']
+            question = example["problem"]
 
-        text_prompt =  f"{question}\n" + self.TYPE_TEMPLATE[example['problem_type']]
+        subtitle = example.get("subtitle")
+        subtitle_prompt = ""
+        if isinstance(subtitle, str) and subtitle.strip():
+            subtitle_prompt = f"\nThe subtitle of this video is: <Subtitle>{subtitle.strip()}</Subtitle>."
+
+        text_prompt = f"{subtitle_prompt}\n{question}\n" + self.TYPE_TEMPLATE[example["problem_type"]]
 
         if use_audio_in_video:
-            if isinstance(example['path'], str):
-                video_audio_avaliable = check_if_video_has_audio(example['path']) and example['data_type'] == "video"
-                if video_audio_avaliable:
-                    msg =[{
+            if isinstance(example["path"], str):
+                has_separate_audio = "audio_path" in example and example["audio_path"]
+                if has_separate_audio:
+                    audio_source = example["audio_path"]
+                    msg = [
+                        {
                             "role": "user",
                             "content": [
                                 {
-                                    "type": example['data_type'],
-                                    example['data_type']: example['path']
+                                    "type": example["data_type"],
+                                    example["data_type"]: example["path"],
                                 },
-                                {
-                                "type": "audio",
-                                "audio": example['path']
-                                },
+                                {"type": "audio", "audio": audio_source},
                                 {
                                     "type": "text",
-                                    "text": f"Here is a {example['data_type']}, with the audio from the video.\n" + text_prompt
-                                }
-                                ]
-                        }]
-                    
+                                    "text": f"Here is a {example['data_type']}, with the audio from the video.\n" + text_prompt,
+                                },
+                            ],
+                        }
+                    ]
                 else:
-                    msg =[{
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": example['data_type'],
-                                    example['data_type']: example['path']
-                                },
-                
-                                {
-                                    "type": "text",
-                                    "text": f"Here is the {example['data_type']}, and there is no audio information, you don't need to process the audio.\n" + text_prompt
-                                }
-                                ]
-                        }]
+                    video_audio_avaliable = (
+                        check_if_video_has_audio(example["path"]) and example["data_type"] == "video"
+                    )
+                    if video_audio_avaliable:
+                        msg = [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": example["data_type"],
+                                        example["data_type"]: example["path"],
+                                    },
+                                    {"type": "audio", "audio": example["path"]},
+                                    {
+                                        "type": "text",
+                                        "text": f"Here is a {example['data_type']}, with the audio from the video.\n" + text_prompt,
+                                    },
+                                ],
+                            }
+                        ]
+                    else:
+                        msg = [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": example["data_type"],
+                                        example["data_type"]: example["path"],
+                                    },
+                                    {
+                                        "type": "text",
+                                        "text": f"Here is the {example['data_type']}, and there is no audio information, you don't need to process the audio.\n"
+                                        + text_prompt,
+                                    },
+                                ],
+                            }
+                        ]
             else:
-                msg =[{
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "image",
-                                    "image": example['path']["image"]
-                                },
-                                {
-                                    "type": "audio",
-                                    "audio": example['path']["audio"]
-                                },
-                                {
-                                    "type": "text",
-                                    "text": f"Here is the image, with the coresponding audio.\n" + text_prompt
-                                }
-                                ]
-                        }]
-        else:
-            msg =[{
+                msg = [
+                    {
                         "role": "user",
                         "content": [
+                            {"type": "image", "image": example["path"]["image"]},
+                            {"type": "audio", "audio": example["path"]["audio"]},
                             {
-                                "type": example['data_type'],
-                                example['data_type']: example['path']
+                                "type": "text",
+                                "text": f"Here is the image, with the corresponding audio.\n" + text_prompt,
                             },
-                            {
-                                "type": "text",
-                                "text": text_prompt
-                            }
-                            ]
-                    }]
+                        ],
+                    }
+                ]
+        else:
+            msg = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": example["data_type"],
+                            example["data_type"]: example["path"],
+                        },
+                        {"type": "text", "text": text_prompt},
+                    ],
+                }
+            ]
 
-    
-            
-        msg.insert(0, {
-                        "role": "system",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": SYSTEM_PROMPT
-                            }
-                            ]
-                    })
+        msg.insert(
+            0,
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": AFFECT_SYSTEM_PROMPT,
+                    }
+                ],
+            },
+        )
 
-        
         return msg
 
     def __getitem__(self, i):
@@ -391,36 +418,41 @@ class LazySupervisedDataset(Dataset):
         # has_image = ('image' in source) or ('video' in source) or ('video_long' in source)
         # print(self.use_audio_in_video)
         if "path" in source:
-            conversation  = self._make_conversation_image_and_video(source, use_audio_in_video=self.use_audio_in_video)
-            problem_type = source["problem_type"]
-            audios, images, videos = process_mm_info(conversation, use_audio_in_video=False)
-       
-        solution = source["solution"]
-        # print(conversation, solution)
-        # delay tokenizer
+            conversation = self._make_conversation_image_and_video(source, use_audio_in_video=self.use_audio_in_video)
+            problem_type = source.get("problem_type", "emer_ov")  # Default for RL data
+            has_separate_audio = "audio_path" in source and source["audio_path"]
+            use_audio_in_video_for_processing = False if has_separate_audio else self.use_audio_in_video
+            audios, images, videos = process_mm_info(conversation, use_audio_in_video=use_audio_in_video_for_processing)
+
+        # RL data has 'openset', SFT data has 'solution'
+        openset = source.get("openset")
+        solution = source.get("solution")
+
         return {
-            'images': images,
-            'audios': audios,
-            'videos': videos,
-            'conversation': conversation,
-            'prompt': conversation,
-            'solution': solution,
-            "problem_type": problem_type
-        #  
+            "images": images,
+            "audios": audios,
+            "videos": videos,
+            "conversation": conversation,
+            "prompt": conversation,
+            "openset": openset,  # For RL reward calculation
+            "solution": solution,  # For SFT (if any)
+            "problem_type": problem_type,
+            "use_audio_in_video": self.use_audio_in_video,
         }
 
 
 def get_vlm_module(model_name_or_path):
-    if "qwen" in model_name_or_path.lower() and "omni" in model_name_or_path.lower():
-        return QwenOmniModule
-    elif "internvl" in model_name_or_path.lower():
-        return InvernVLModule
-    elif "ola" in model_name_or_path.lower():
-        return QwenOlaModule
-    elif "qwen" in model_name_or_path.lower() and "vl" in model_name_or_path.lower():
-        return Qwen2VLModule
-    else:
-        raise ValueError(f"Unsupported model: {model_name_or_path}")
+    # if "qwen" in model_name_or_path.lower() and "omni" in model_name_or_path.lower():
+    #     return QwenOmniModule
+    # elif "internvl" in model_name_or_path.lower():
+    #     return InvernVLModule
+    # elif "ola" in model_name_or_path.lower():
+    #     return QwenOlaModule
+    # elif "qwen" in model_name_or_path.lower() and "vl" in model_name_or_path.lower():
+    #     return Qwen2VLModule
+    # else:
+    #     raise ValueError(f"Unsupported model: {model_name_or_path}")
+    return QwenOmniModule
 
 def main(script_args, training_args, model_args):
     # Load the VLM module
@@ -434,7 +466,27 @@ def main(script_args, training_args, model_args):
         "reasoning": vlm_module_cls.patial_reasoning_reward,
         "context": vlm_module_cls.patial_context_reward
     }
-    reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
+    
+    # Modified to support dynamic loading of reward functions
+    reward_funcs = []
+    for func_name in script_args.reward_funcs:
+        if func_name in reward_funcs_registry:
+            reward_funcs.append(reward_funcs_registry[func_name])
+        elif "." in func_name:
+            # Dynamically load reward function if it contains a dot (e.g., module.function)
+            import importlib
+            module_name, function_name = func_name.rsplit(".", 1)
+            try:
+                module = importlib.import_module(module_name)
+                reward_func = getattr(module, function_name)
+                reward_funcs.append(reward_func)
+                print(f"[GRPO] Successfully loaded custom reward function: {func_name}")
+            except Exception as e:
+                raise ValueError(f"Failed to load reward function '{func_name}': {e}")
+        else:
+             raise ValueError(f"Reward function '{func_name}' not found in registry or as a module path.")
+             
+    # reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
     print(script_args.reward_funcs)
     
     print("reward_funcs:", reward_funcs)

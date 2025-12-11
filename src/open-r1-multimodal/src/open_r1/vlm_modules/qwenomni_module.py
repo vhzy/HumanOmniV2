@@ -16,8 +16,10 @@ import requests
 import re
 
 
-url = os.environ["API"]
-token = os.environ["API_KEY"]
+# url = os.environ["API"]
+# token = os.environ["API_KEY"]
+url = ""
+token = ""
 
 def gpt_api(prompt, model_name):
     messages = [

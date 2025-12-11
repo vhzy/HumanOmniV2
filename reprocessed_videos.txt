@@ -1,0 +1,10 @@
+/mnt/afs/hanzhiyuan/datasets/mer2025/video/video_face/samplenew3_00000136.mp4
+/mnt/afs/hanzhiyuan/datasets/mer2025/video/video_face/samplenew3_00065206.mp4
+/mnt/afs/hanzhiyuan/datasets/mer2025/video/video_face/samplenew3_00074335.mp4
+/mnt/afs/hanzhiyuan/datasets/mer2025/video/video_face/samplenew_00015337.mp4
+/mnt/afs/hanzhiyuan/datasets/mer2025/video/video_face/samplenew3_00048403.mp4
+/mnt/afs/hanzhiyuan/datasets/mer2025/video/video_face/samplenew4_00005553.mp4
+/mnt/afs/hanzhiyuan/datasets/mer2025/video/video_face/samplenew3_00072071.mp4
+/mnt/afs/hanzhiyuan/datasets/mer2025/video/video_face/samplenew3_00057511.mp4
+/mnt/afs/hanzhiyuan/datasets/mer2025/cmumosei-process/video_face/iXiMifHNKPI_14.mp4
+/mnt/afs/hanzhiyuan/datasets/mer2025/video/video_face/samplenew3_00029785.mp4

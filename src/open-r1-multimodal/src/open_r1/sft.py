@@ -46,11 +46,11 @@ from torch.utils.data import Dataset
 import transformers
 from datasets import load_dataset
 from transformers import AutoTokenizer, set_seed, AutoProcessor
-from transformers import Qwen2_5OmniThinkerForConditionalGeneration
-from transformers import Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration
+from transformers import Qwen2_5OmniThinkerForConditionalGeneration, Qwen2_5OmniProcessor
+# from transformers import Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration
 from transformers.trainer_utils import get_last_checkpoint
-from open_r1.configs import SFTConfig
-from open_r1.utils.callbacks import get_callbacks
+from src.open_r1.configs import SFTConfig
+from src.open_r1.utils.callbacks import get_callbacks
 import yaml
 import json
 import math
@@ -66,10 +66,11 @@ from trl import (
     get_peft_config,
     get_quantization_config,
 )
-from dataclasses import field
+from dataclasses import dataclass, field
 from qwen_vl_utils import process_vision_info
 from qwen_omni_utils import process_mm_info
 import av
+from src.open_r1.prompts import AFFECT_SYSTEM_PROMPT
 
 def check_if_video_has_audio(video_path):
     try:
@@ -95,16 +96,17 @@ class SFTModelConfig(ModelConfig):
 
 processor = None
 
-SYSTEM_PROMPT = """You are a helpful assistant. Your primary goal is to deeply analyze and interpret information from available various modalities (image, video, audio, text context) to answer questions with human-like depth and a clear, traceable thought process.
+# AFFECT_SYSTEM_PROMPT = """You are a helpful assistant. Your primary goal is to deeply analyze and interpret information from available various modalities (image, video, audio, text context) to answer questions with human-like depth and a clear, traceable thought process.
 
-Begin by thoroughly understanding the image, video, audio or other available context information, and then proceed with an in-depth analysis related to the question. 
+# Begin by thoroughly understanding the image, video, audio or other available context information, and then proceed with an in-depth analysis related to the question. 
 
-In reasoning, It is encouraged to incorporate self-reflection and verification into your reasoning process. You are encouraged to review the image, video, audio, or other context information to ensure the answer accuracy.
+# In reasoning, It is encouraged to incorporate self-reflection and verification into your reasoning process. You are encouraged to review the image, video, audio, or other context information to ensure the answer accuracy.
 
-Provide your understanding of the image, video, and audio between the <context> </context> tags, detail the reasoning between the <think> </think> tags, and then give your final answer between the <answer> </answer> tags.
-"""
+# Provide your understanding of the image, video, and audio between the <context> </context> tags, detail the reasoning between the <think> </think> tags, and then give your final answer between the <answer> </answer> tags.
+# """
 
-
+# if "problem" not in example:
+# example["problem"] = "As an expert in the field of emotions, please focus on the facial expressions, body movements, tone, subtitle content, etc., in the video to discern clues related to the emotions of the individual. Please provide a detailed description and ultimately predict the emotional state of the individual in the video."
 
 
 class LazySupervisedDataset(Dataset):
@@ -193,8 +195,18 @@ class LazySupervisedDataset(Dataset):
     
 
      
-
     def _make_conversation_image_and_video(self, example, use_audio_in_video=False):
+        if "problem" not in example or not example["problem"]:
+            example["problem"] = (
+                # "Please analyze the video by integrating its visual appearance, body movements, vocal cues, subtitle content, etc. "
+                # "Provide a concise explanation of the multimodal clues you relied on, then infer the person's emotional state with open-vocabulary emotion words."
+                "As an expert in the field of emotions, please focus on the facial expressions, body movements, tone, subtitle content, etc., in the video to discern clues related to the emotions of the individual. Please provide a detailed description and ultimately predict the emotional state of the individual in the video."
+            )
+        if "problem_type" not in example:
+            example["problem_type"] = "emer_ov"
+        if "data_type" not in example:
+            example["data_type"] = "video"
+
         if example["problem_type"] == 'multiple choice' or  example["problem_type"] == 'emer_ov_mc':
             question = example['problem'] + "Options:\n"
             for op in example["options"]:
@@ -204,11 +216,20 @@ class LazySupervisedDataset(Dataset):
 
         assert "<think>" in  example['solution']
         
-        text_prompt =  f"{question}\n" + self.TYPE_TEMPLATE[example['problem_type']]
+        subtitle = example.get("subtitle")
+        subtitle_prompt = ""
+        if isinstance(subtitle, str) and subtitle.strip():
+            subtitle_prompt = f"\nThe subtitle of this video is: <Subtitle>{subtitle.strip()}</Subtitle>."
+
+        text_prompt =  f"{subtitle_prompt}\n{question}\n" + self.TYPE_TEMPLATE[example['problem_type']]
         if use_audio_in_video:
             if isinstance(example['path'], str):
-                video_audio_avaliable = check_if_video_has_audio(example['path']) and example['data_type'] == "video"
-                if video_audio_avaliable:
+                # 优先使用独立的音频文件（如果存在 audio_path 字段），避免从视频提取
+                has_separate_audio = 'audio_path' in example and example['audio_path']
+                
+                if has_separate_audio:
+                    # 有独立音频文件，直接使用
+                    audio_source = example['audio_path']
                     msg =[{
                             "role": "user",
                             "content": [
@@ -218,7 +239,7 @@ class LazySupervisedDataset(Dataset):
                                 },
                                 {
                                 "type": "audio",
-                                "audio": example['path']
+                                "audio": audio_source
                                 },
                                 {
                                     "type": "text",
@@ -226,21 +247,41 @@ class LazySupervisedDataset(Dataset):
                                 }
                                 ]
                         }]
-                    
                 else:
-                    msg =[{
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": example['data_type'],
-                                    example['data_type']: example['path']
-                                },
-                                {
-                                    "type": "text",
-                                    "text": f"Here is the {example['data_type']}, and there is no audio information, you don't need to process the audio.\n" + text_prompt
-                                }
-                                ]
-                        }]
+                    # 没有独立音频，检查视频是否有音频
+                    video_audio_avaliable = check_if_video_has_audio(example['path']) and example['data_type'] == "video"
+                    if video_audio_avaliable:
+                        msg =[{
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": example['data_type'],
+                                        example['data_type']: example['path']
+                                    },
+                                    {
+                                    "type": "audio",
+                                    "audio": example['path']
+                                    },
+                                    {
+                                        "type": "text",
+                                        "text": f"Here is a {example['data_type']}, with the audio from the video.\n" + text_prompt
+                                    }
+                                    ]
+                            }]
+                    else:
+                        msg =[{
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": example['data_type'],
+                                        example['data_type']: example['path']
+                                    },
+                                    {
+                                        "type": "text",
+                                        "text": f"Here is the {example['data_type']}, and there is no audio information, you don't need to process the audio.\n" + text_prompt
+                                    }
+                                    ]
+                            }]
             else:
                 msg =[{
                             "role": "user",
@@ -288,7 +329,7 @@ class LazySupervisedDataset(Dataset):
                 "content": [
                     {
                         "type": "text",
-                        "text": SYSTEM_PROMPT
+                        "text": AFFECT_SYSTEM_PROMPT
                     }
                     ]
             })
@@ -324,10 +365,14 @@ class LazySupervisedDataset(Dataset):
 
     def _get_item(self, i):
         source = self.list_data_dict[i]
-
        
         messages  = self._make_conversation_image_and_video(source, use_audio_in_video=self.script_args.use_audio_in_video)
-        audios, images, videos = process_mm_info(messages, use_audio_in_video=False)
+        
+        # 关键：如果有独立音频文件，不要让 process_mm_info 尝试从视频提取音频
+        has_separate_audio = 'audio_path' in source and source['audio_path']
+        use_audio_in_video_for_processing = False if has_separate_audio else self.script_args.use_audio_in_video
+        
+        audios, images, videos = process_mm_info(messages, use_audio_in_video=use_audio_in_video_for_processing)
 
    
            
@@ -378,6 +423,8 @@ def collate_fn(examples):
         videos=videos,
         return_tensors="pt",
         padding=True,
+        # truncation=True,
+        # max_length=8192,  # 限制最大序列长度
         use_audio_in_video=False
     )
     # print(batch.keys())
@@ -415,6 +462,13 @@ def main(script_args, training_args, model_args):
     logger.setLevel(log_level)
     datasets.utils.logging.set_verbosity(log_level)
     transformers.utils.logging.set_verbosity(log_level)
+    
+    # Filter out the system prompt warning since we're using Thinker (no audio output needed)
+    class SystemPromptWarningFilter(logging.Filter):
+        def filter(self, record):
+            return "System prompt modified, audio output may not work" not in record.getMessage()
+    
+    logging.getLogger("root").addFilter(SystemPromptWarningFilter())
     transformers.utils.logging.enable_default_handler()
     transformers.utils.logging.enable_explicit_format()
 
@@ -445,11 +499,11 @@ def main(script_args, training_args, model_args):
     ################
     global processor
     if "vl" in model_args.model_name_or_path.lower() or "omni" in model_args.model_name_or_path.lower():
-
-        processor = AutoProcessor.from_pretrained(
+        # Use Qwen2_5OmniProcessor directly to avoid AutoProcessor video processor detection issues
+        processor = Qwen2_5OmniProcessor.from_pretrained(
             model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code
         )
-        logger.info("Using AutoProcessor for vision-language model.")
+        logger.info("Using Qwen2_5OmniProcessor for qwen-omni model.")
     else:
         processor = AutoTokenizer.from_pretrained(
             model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, use_fast=True
@@ -479,21 +533,25 @@ def main(script_args, training_args, model_args):
     )
     # training_args.model_init_kwargs = model_kwargs
 
-    if "Qwen2-VL" in model_args.model_name_or_path:
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_args.model_name_or_path, **model_kwargs
-        )
-    elif "Qwen2.5-VL" in model_args.model_name_or_path:
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_args.model_name_or_path, **model_kwargs
-        )
-    elif "qwen" in model_args.model_name_or_path.lower() and "omni" in model_args.model_name_or_path.lower():
-        model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(model_args.model_name_or_path, **model_kwargs)
-        model.config.vocab_size = 152064
+    # if "Qwen2-VL" in model_args.model_name_or_path:
+    #     model = Qwen2VLForConditionalGeneration.from_pretrained(
+    #         model_args.model_name_or_path, **model_kwargs
+    #     )
+    # elif "Qwen2.5-VL" in model_args.model_name_or_path:
+    #     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    #         model_args.model_name_or_path, **model_kwargs
+    #     )
+    # elif "qwen" in model_args.model_name_or_path.lower() and "omni" in model_args.model_name_or_path.lower():
+    #     # model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(model_args.model_name_or_path, **model_kwargs)
+    #     # model.config.vocab_size = 152064
 
-        vision_modules_keywords = ['visual','audio_tower']
-    else:
-        raise ValueError(f"Unsupported model: {model_args.model_name_or_path}")
+    #     # vision_modules_keywords = ['visual','audio_tower']
+    # else:
+    #     raise ValueError(f"Unsupported model: {model_args.model_name_or_path}")
+    model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(model_args.model_name_or_path, **model_kwargs)
+    model.config.vocab_size = 152064
+
+    vision_modules_keywords = ['visual','audio_tower']
 
     if model_args.freeze_vision_modules:
         logger.info("Freezing vision modules...")
@@ -519,7 +577,7 @@ def main(script_args, training_args, model_args):
         args=training_args,
         train_dataset=dataset,
         eval_dataset=None,
-        processing_class=processor.tokenizer,
+        processing_class=processor,
         data_collator=collate_fn,
         peft_config=get_peft_config(model_args),
         callbacks=get_callbacks(training_args, model_args),
