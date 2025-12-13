@@ -438,6 +438,9 @@ class LazySupervisedDataset(Dataset):
             "solution": solution,  # For SFT (if any)
             "problem_type": problem_type,
             "use_audio_in_video": self.use_audio_in_video,
+            # 透传 path 与已抽取线索，供自定义 reward 使用（Rubric 感知/连贯）
+            "path": source.get("path"),
+            "extracted_clues": source.get("extracted_clues"),
         }
 
 
@@ -455,6 +458,13 @@ def get_vlm_module(model_name_or_path):
     return QwenOmniModule
 
 def main(script_args, training_args, model_args):
+    # Ensure deterministic dataset sampling for YAML `sampling_strategy: random:*`
+    # (dataset is built before Trainer seeds RNGs)
+    try:
+        seed = training_args.data_seed if getattr(training_args, "data_seed", None) is not None else training_args.seed
+        random.seed(seed)
+    except Exception:
+        pass
     # Load the VLM module
     vlm_module_cls = get_vlm_module(model_args.model_name_or_path)
     print("using vlm module:", vlm_module_cls.__name__)

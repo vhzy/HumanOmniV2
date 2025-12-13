@@ -791,20 +791,48 @@ class VLMGRPOTrainer(Trainer):
         #     prompt_inputs["attention_mask"] = prompt_mask
 
         # Generate completions
-        with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
-            generate_returned_result = unwrapped_model.generate(
-                **{k: v for k, v in prompt_inputs.items() if k not in self.vlm_module.get_non_generate_params()}, 
-                generation_config=self.generation_config
-            )
-            prompt_length = prompt_ids.size(1)
-            if not self.vlm_module.is_embeds_input():
-                prompt_completion_ids = generate_returned_result
-                completion_ids = prompt_completion_ids[:, prompt_length:]
-            else:
-                # In this case, the input of the LLM backbone is the embedding of the combination of the image and text prompt
-                # So the returned result of the `generate` method only contains the completion ids
-                completion_ids = generate_returned_result
-                prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        try:
+            with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
+                generate_returned_result = unwrapped_model.generate(
+                    **{k: v for k, v in prompt_inputs.items() if k not in self.vlm_module.get_non_generate_params()}, 
+                    generation_config=self.generation_config
+                )
+                prompt_length = prompt_ids.size(1)
+                if not self.vlm_module.is_embeds_input():
+                    prompt_completion_ids = generate_returned_result
+                    completion_ids = prompt_completion_ids[:, prompt_length:]
+                else:
+                    # In this case, the input of the LLM backbone is the embedding of the combination of the image and text prompt
+                    # So the returned result of the `generate` method only contains the completion ids
+                    completion_ids = generate_returned_result
+                    prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        except Exception as e:
+            # Print problematic sample info for debugging
+            print(f"\n[Error] Exception during generate(): {e}")
+            print(f"[Error] Failed inputs info (batch_size={len(inputs)}, use_audio_in_video={use_audio_in_video}):")
+            for i, example in enumerate(inputs):
+                print(f"--- Sample {i} ---")
+                if isinstance(example, dict):
+                    try:
+                        print(f"Keys: {sorted(example.keys())}")
+                    except Exception:
+                        pass
+                    if "path" in example:
+                        print(f"Path: {example.get('path')}")
+                    if "audio_path" in example:
+                        print(f"Audio Path: {example.get('audio_path')}")
+                    if "prompt" in example:
+                        # Print first 400 chars of prompt or conversation
+                        prompt_preview = str(example.get("prompt"))[200:]
+                        print(f"Prompt preview: {prompt_preview}...")
+                else:
+                    print(f"Example type: {type(example).__name__}")
+                    print(f"Example preview: {str(example)[200:]}...")
+                # prepared prompt often easiest to search in logs
+                if isinstance(prompts_text, (list, tuple)) and i < len(prompts_text):
+                    prepared_preview = str(prompts_text[i])[200:]
+                    print(f"Prepared prompt preview: {prepared_preview}...")
+            raise
 
 
         # Mask everything after the first EOS token
@@ -850,19 +878,30 @@ class VLMGRPOTrainer(Trainer):
         except Exception as e:
             # Print problematic sample info for debugging
             print(f"\n[Error] Exception during logit computation: {e}")
-            print(f"[Error] Failed inputs info:")
+            print(f"[Error] Failed inputs info (batch_size={len(inputs)}, use_audio_in_video={use_audio_in_video}):")
             for i, example in enumerate(inputs):
                 print(f"--- Sample {i} ---")
-                if 'path' in example:
-                    print(f"Path: {example['path']}")
-                if 'audio_path' in example:
-                    print(f"Audio Path: {example.get('audio_path')}")
-                if 'prompt' in example:
-                    # Print first 200 chars of prompt or conversation
-                    prompt_preview = str(example['prompt'])[:200]
-                    print(f"Prompt preview: {prompt_preview}...")
-                
-            raise e
+                if isinstance(example, dict):
+                    try:
+                        print(f"Keys: {sorted(example.keys())}")
+                    except Exception:
+                        pass
+                    if "path" in example:
+                        print(f"Path: {example.get('path')}")
+                    if "audio_path" in example:
+                        print(f"Audio Path: {example.get('audio_path')}")
+                    if "prompt" in example:
+                        # Print first 400 chars of prompt or conversation
+                        prompt_preview = str(example.get("prompt"))[200:]
+                        print(f"Prompt preview: {prompt_preview}...")
+                else:
+                    print(f"Example type: {type(example).__name__}")
+                    print(f"Example preview: {str(example)[200:]}...")
+                if isinstance(prompts_text, (list, tuple)) and i < len(prompts_text):
+                    prepared_preview = str(prompts_text[i])[200:]
+                    print(f"Prepared prompt preview: {prepared_preview}...")
+            raise
+
 
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
