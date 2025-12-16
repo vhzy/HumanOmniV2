@@ -2,8 +2,8 @@
 
 # 提交任务信息
 WORKSPACE=a58d023b-de76-475f-89c2-7e50f7aa3c7a
-PARTITION=amplarge2
-# PARTITION=h100-share2
+# PARTITION=amplarge2
+PARTITION=h100-share2
 # PARTITION=h100-share3
 # PARTITION=m-train-1
 # PARTITION=m-train-2
@@ -33,13 +33,13 @@ LOG_FILE="$LOG_DIR/merbench_infer_${DATE}.log"
 ENV_COMMAND="source /usr/local/miniconda3/etc/profile.d/conda.sh 2>/dev/null || source /mnt/afs/hanzhiyuan/miniconda3/etc/profile.d/conda.sh && \
 conda activate /mnt/afs/hanzhiyuan/.conda/envs/humanomni_v2"
 
-MODEL_PATH=/mnt/afs/hanzhiyuan/code/HumanOmniV2/affect_r1/output/affect_r1_grpo14/checkpoint-1000
+MODEL_PATH=/mnt/afs/hanzhiyuan/code/HumanOmniV2/affect_r1/output/affect_r1_grpo_stage2_6/checkpoint-2000
 PROCESSOR_PATH=$MODEL_PATH
 DATASET_ROOT=/mnt/afs/hanzhiyuan/datasets
-OUTPUT_ROOT=/mnt/afs/hanzhiyuan/code/HumanOmniV2/affect_r1/output/affect_r1_grpo14/checkpoint-1000/inference
+OUTPUT_ROOT=/mnt/afs/hanzhiyuan/code/HumanOmniV2/affect_r1/output/affect_r1_grpo_stage2_6/checkpoint-2000/inference
 RUN_NAME=merbench_baseline
-CKPT_NAME=checkpoint-1000
-DATASETS="CMUMOSEI,SIMS,SIMSV2"
+CKPT_NAME=checkpoint-2000
+DATASETS="OVMERDPlus,MER2023,MER2024,MELD,IEMOCAPFour,CMUMOSI,CMUMOSEI,SIMS,SIMSV2"
 # DATASETS="IEMOCAPFour"OVMERDPlus,MER2023,MER2024,MELD,IEMOCAPFour,CMUMOSI,
 
 # Inference command
@@ -64,6 +64,7 @@ COMMAND="cd \"$WORKDIR\" && ${ENV_COMMAND} && ${EXE_COMMAND} >> \"${LOG_FILE}\" 
 echo ">>> MERBench inference job submitted"
 echo "Command: ${COMMAND}"
 echo "Log file: ${LOG_FILE}"
+
 
 sco acp jobs create \
 --workspace-name "$WORKSPACE" \

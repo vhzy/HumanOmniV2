@@ -12,7 +12,7 @@ PARTITION=amplarge2
 CONTAINTER=registry.ms-sc-01.maoshanwangtech.com/lepton-trainingjob/nvidia24.04-ubuntu22.04-py3.10-cuda12.4-cudnn9.1-torch2.3.0-transformerengine1.5:v1.0.0-20241130-nvdia-base-image
 MOUNT=1f29056c-c3f2-11ee-967e-2aea81fd34ba:/mnt/afs2,047443d2-c3f2-11ee-a5f9-9e29792dec2f:/mnt/afs1,ce3b1174-f6eb-11ee-a372-82d352e10aed:/mnt/afs
 
-nodes=2
+nodes=1
 GPUS=8
 CPU=64
 MEM=1024
@@ -26,12 +26,12 @@ fi
 WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Training parameters
-RUN_NAME="affect_r1_grpo_stage2_9"
+RUN_NAME="affect_r1_grpo_stage3_1"
 OUTPUT_ROOT="/mnt/afs/hanzhiyuan/code/HumanOmniV2/affect_r1/output"
 OUTPUT_DIR="${OUTPUT_ROOT}/${RUN_NAME}"
 
 SFT_MODEL_PATH="/mnt/afs/hanzhiyuan/code/HumanOmniV2/affect_r1/output/sft_baseline_5k_2/checkpoint-314"
-DATA_CONFIG="/mnt/afs/hanzhiyuan/code/HumanOmniV2/affect_r1/data/rl_config.yaml"
+DATA_CONFIG="/mnt/afs/hanzhiyuan/code/HumanOmniV2/affect_r1/data/rl_config_stage3.yaml"
 DEEPSPEED_CONFIG="/mnt/afs/hanzhiyuan/code/HumanOmniV2/src/open-r1-multimodal/run_scripts/zero3_offload.json"
 
 # 日志写入训练输出目录
@@ -80,8 +80,8 @@ torchrun --nproc_per_node $GPUS --nnodes $nodes --node_rank \$NODE_RANK --master
     --data_seed 42 \
     --report_to wandb \
     --scale_rewards false \
-    --reward_funcs affect_reward.emotion_wheel_reward affect_reward.format_reward affect_reward.rubric_perc_reward affect_reward.rubric_coh_reward\
-    --reward_weights 1.0 0.1 0.5 0.5 \
+    --reward_funcs affect_reward.emotion_wheel_reward affect_reward.format_reward logit_reward.coherence \
+    --reward_weights 1.0 0.1 0.1 \
     --use_audio_in_video true \
     --gradient_checkpointing true \
     --log_completions true \
@@ -90,7 +90,7 @@ torchrun --nproc_per_node $GPUS --nnodes $nodes --node_rank \$NODE_RANK --master
     --run_name $RUN_NAME \
     --save_steps 500 \
     --save_only_model false \
-    --max_grad_norm 1.0 \
+    --max_grad_norm 1.5 \
     --dataloader_num_workers 16"
 
 COMMAND="cd \"$WORKDIR\" && ${ENV_COMMAND} && ${EXE_COMMAND} >> \"${LOG_FILE}\" 2>&1"

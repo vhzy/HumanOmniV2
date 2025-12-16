@@ -66,6 +66,18 @@ if is_wandb_available():
     import wandb
 
 from open_r1.vlm_modules.vlm_module import VLMBaseModule
+
+# Logit-based reward (optional)
+try:
+    from affect_r1.logit_reward import (
+        LogitRewardConfig,
+        LogitRewardComputer,
+        create_logit_reward_computer,
+    )
+    LOGIT_REWARD_AVAILABLE = True
+except ImportError:
+    LOGIT_REWARD_AVAILABLE = False
+
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
@@ -651,6 +663,49 @@ class VLMGRPOTrainer(Trainer):
             if isinstance(reward_func, PreTrainedModel):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
 
+        # Initialize logit-based reward computer (optional)
+        # Now configured via reward_funcs: logit_reward.coherence, logit_reward.perception
+        self.logit_reward_computer = None
+        self.logit_reward_weights = {}  # {'coherence': weight, 'perception': weight}
+        
+        # Get logit_reward_config from args (set by grpo_qwenomni.py)
+        logit_reward_config = getattr(args, 'logit_reward_config', {})
+        self.use_logit_reward = len(logit_reward_config) > 0
+        
+        print(f"[LogitReward DEBUG] logit_reward_config: {logit_reward_config}")
+        print(f"[LogitReward DEBUG] use_logit_reward: {self.use_logit_reward}")
+        print(f"[LogitReward DEBUG] LOGIT_REWARD_AVAILABLE: {LOGIT_REWARD_AVAILABLE}")
+        
+        if self.use_logit_reward:
+            if not LOGIT_REWARD_AVAILABLE:
+                warnings.warn(
+                    "logit_reward.* specified in reward_funcs but logit_reward module is not available. "
+                    "Please ensure affect_r1.logit_reward is in PYTHONPATH."
+                )
+                self.use_logit_reward = False
+            else:
+                # Parse logit_reward_config
+                # coherence weight -> use_coherence_reward and its weight
+                # perception weight -> use_perception_reward and its weight
+                self.logit_reward_weights = logit_reward_config.copy()
+                
+                tokenizer = getattr(processing_class, 'tokenizer', processing_class)
+                logit_config = LogitRewardConfig(
+                    use_coherence_reward='coherence' in logit_reward_config,
+                    use_perception_reward='perception' in logit_reward_config,
+                    alpha=1.0,  # 内部不再加权，权重在 grpo_trainer 中通过 reward_weights 统一应用
+                    beta=1.0,   # 内部不再加权，权重在 grpo_trainer 中通过 reward_weights 统一应用
+                    normalize_rewards=getattr(args, 'logit_reward_normalize', False),
+                )
+                self.logit_reward_computer = create_logit_reward_computer(
+                    tokenizer=tokenizer,
+                    emotion_wheel_root=getattr(args, 'emotion_wheel_root', None),
+                    config=logit_config,
+                )
+                print(f"[LogitReward] Initialized with unified config:")
+                print(f"  - coherence: {'enabled' if 'coherence' in logit_reward_config else 'disabled'}, weight={logit_reward_config.get('coherence', 0.0)}")
+                print(f"  - perception: {'enabled' if 'perception' in logit_reward_config else 'disabled'}, weight={logit_reward_config.get('perception', 0.0)}")
+
     def _enable_gradient_checkpointing(self, model: PreTrainedModel, args: GRPOConfig) -> PreTrainedModel:
         """Enables gradient checkpointing for the model."""
         # Ensure use_cache is disabled
@@ -1009,6 +1064,62 @@ class VLMGRPOTrainer(Trainer):
         # rewards_per_func = rewards_per_func[process_slice, :]
 
         rewards = torch.stack(full_rewards, dim=-1).nansum(dim=1)
+        
+        # Compute logit-based rewards (optional) - 在归一化之前添加到 rewards
+        logit_rewards_dict = None
+        if self.use_logit_reward and self.logit_reward_computer is not None:
+            print(f"[LogitReward DEBUG] Computing logit rewards...")
+            try:
+                # 准备 GT 类别列表（从 inputs 中获取 openset）
+                gt_categories_list = []
+                for example in inputs:
+                    openset = example.get('openset', [])
+                    if isinstance(openset, str):
+                        openset = [s.strip() for s in openset.split(',')]
+                    elif openset is None:
+                        openset = []
+                    gt_categories_list.append(openset if openset else [])
+                
+                # 计算 logit reward
+                logit_rewards_dict = self.logit_reward_computer.compute_rewards(
+                    model=self.model,
+                    input_ids=prompt_completion_ids,
+                    attention_mask=attention_mask,
+                    multimodal_inputs=multimodal_inputs,
+                    gt_categories_list=gt_categories_list,
+                    completion_ids=completion_ids,
+                )
+                
+                # 使用统一的权重配置，手动加权各个组件
+                # logit_reward_weights: {'coherence': weight, 'perception': weight}
+                logit_total_reward = torch.zeros_like(rewards)
+                
+                # 使用 tanh 平滑限制 logit reward 范围到 [-1, 1]
+                if 'coherence' in self.logit_reward_weights:
+                    coherence_weight = self.logit_reward_weights['coherence']
+                    coherence_raw = logit_rewards_dict["coherence"]
+                    coherence_scaled = torch.tanh(coherence_raw)  # 平滑映射到 [-1, 1]
+                    logit_total_reward = logit_total_reward + coherence_weight * coherence_scaled
+                    print(f"[LogitReward DEBUG] coherence: weight={coherence_weight}, raw_mean={coherence_raw.mean().item():.4f}, tanh_mean={coherence_scaled.mean().item():.4f}")
+                
+                if 'perception' in self.logit_reward_weights:
+                    perception_weight = self.logit_reward_weights['perception']
+                    perception_raw = logit_rewards_dict["perception"]
+                    perception_scaled = torch.tanh(perception_raw)  # 平滑映射到 [-1, 1]
+                    logit_total_reward = logit_total_reward + perception_weight * perception_scaled
+                    print(f"[LogitReward DEBUG] perception: weight={perception_weight}, raw_mean={perception_raw.mean().item():.4f}, tanh_mean={perception_scaled.mean().item():.4f}")
+                
+                # 将加权后的 logit reward 添加到 rewards 中
+                rewards = rewards + logit_total_reward
+                print(f"[LogitReward DEBUG] Added logit reward to rewards, total_mean: {logit_total_reward.mean().item():.4f}")
+                
+            except Exception as e:
+                import traceback
+                print(f"[LogitReward ERROR] Failed to compute logit rewards: {e}")
+                traceback.print_exc()
+                logit_rewards_dict = None
+        
+        # 现在一起归一化（包含 logit reward）
         advantages, std_grouped_rewards = compute_advantage(rewards)
         advantages = advantages[process_slice]
 
@@ -1026,8 +1137,6 @@ class VLMGRPOTrainer(Trainer):
                 else: # logical
                     mask = generate_2d_mask(completion_ids, [13708, 766], [522, 26865])
                 patial_advantages.append({"name": func_name, "reward":partial_reward, "mask": mask})
-
-
 
         mode = "eval" if self.control.should_evaluate else "train"
 
@@ -1051,6 +1160,18 @@ class VLMGRPOTrainer(Trainer):
             self._metrics[mode][f"rewards/{reward_func_name}"].append(mean_rewards)
         self._metrics[mode]["reward"].append(rewards.mean().item())
         self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
+        
+        # Log logit-based rewards if computed
+        if logit_rewards_dict is not None:
+            self._metrics[mode]["rewards/logit_coherence"].append(
+                logit_rewards_dict["coherence"].mean().item()
+            )
+            self._metrics[mode]["rewards/logit_perception"].append(
+                logit_rewards_dict["perception"].mean().item()
+            )
+            self._metrics[mode]["rewards/logit_total"].append(
+                logit_rewards_dict["total"].mean().item()
+            )
 
         if self.log_completions and self.state.global_step % self.args.logging_steps == 0:
             # Gather across processes so lengths对齐
@@ -1149,24 +1270,29 @@ class VLMGRPOTrainer(Trainer):
 
         # Add KL penalty if beta > 0
         if self.beta > 0:
-            if self.state.global_step >(self.state.max_steps/2):
-                beta = self.beta*0.25 
-            else:
-                beta = self.beta*(1-0.75*self.state.global_step/(self.state.max_steps/2))
             ref_per_token_logps = inputs["ref_per_token_logps"]
             per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-            per_token_loss = per_token_loss + beta * per_token_kl
-
-            # Log KL divergence
-     
             mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
-            self._metrics[mode]["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+            mean_kl_for_threshold = self.accelerator.gather_for_metrics(mean_kl.detach()).mean().item()
+            self._metrics[mode]["kl"].append(mean_kl_for_threshold)
+            
+            if self.state.global_step > (self.state.max_steps / 2):
+                beta = self.beta * 0.25
+            else:
+                beta = self.beta * (1 - 0.75 * self.state.global_step / (self.state.max_steps / 2))
+
+            # If KL is too high, restore beta to the initial value (self.beta)
+            # if mean_kl_for_threshold > 0.08:
+            #     beta = self.beta
+
+            per_token_loss = per_token_loss + beta * per_token_kl
+            self._metrics[mode]["beta"].append(self.accelerator.gather_for_metrics(torch.tensor(beta, device=per_token_logps.device)).mean().item())
 
         # Compute final loss
         loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
 
         # Log clip ratio
-        is_clipped = (per_token_loss1 < per_token_loss2).float()
+        is_clipped = (per_token_loss2 < per_token_loss1).float()
         clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
         self._metrics[mode]["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
 

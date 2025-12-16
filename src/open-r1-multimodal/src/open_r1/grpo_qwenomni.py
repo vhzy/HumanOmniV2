@@ -478,10 +478,26 @@ def main(script_args, training_args, model_args):
     }
     
     # Modified to support dynamic loading of reward functions
+    # Also supports logit_reward.* for logit-based rewards (coherence, perception)
     reward_funcs = []
-    for func_name in script_args.reward_funcs:
-        if func_name in reward_funcs_registry:
+    reward_weights = []
+    logit_reward_config = {}  # {'coherence': weight, 'perception': weight}
+    
+    # Get reward weights (default to 1.0 if not specified)
+    # Note: reward_weights is in training_args (GRPOConfig), not script_args
+    raw_weights = training_args.reward_weights if training_args.reward_weights else [1.0] * len(script_args.reward_funcs)
+    
+    for i, func_name in enumerate(script_args.reward_funcs):
+        weight = raw_weights[i] if i < len(raw_weights) else 1.0
+        
+        # Handle logit_reward.* functions specially
+        if func_name.startswith('logit_reward.'):
+            component = func_name.split('.')[1]  # coherence, perception
+            logit_reward_config[component] = weight
+            print(f"[GRPO] Registered logit reward component: {component} with weight {weight}")
+        elif func_name in reward_funcs_registry:
             reward_funcs.append(reward_funcs_registry[func_name])
+            reward_weights.append(weight)
         elif "." in func_name:
             # Dynamically load reward function if it contains a dot (e.g., module.function)
             import importlib
@@ -490,16 +506,21 @@ def main(script_args, training_args, model_args):
                 module = importlib.import_module(module_name)
                 reward_func = getattr(module, function_name)
                 reward_funcs.append(reward_func)
+                reward_weights.append(weight)
                 print(f"[GRPO] Successfully loaded custom reward function: {func_name}")
             except Exception as e:
                 raise ValueError(f"Failed to load reward function '{func_name}': {e}")
         else:
              raise ValueError(f"Reward function '{func_name}' not found in registry or as a module path.")
-             
-    # reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
-    print(script_args.reward_funcs)
     
-    print("reward_funcs:", reward_funcs)
+    # Store logit_reward_config in training_args for GRPOTrainer to use
+    training_args.logit_reward_config = logit_reward_config
+    # Update reward_weights to only include non-logit rewards
+    training_args.reward_weights = reward_weights
+             
+    print(f"[GRPO] reward_funcs: {script_args.reward_funcs}")
+    print(f"[GRPO] Regular reward_funcs: {reward_funcs}, weights: {reward_weights}")
+    print(f"[GRPO] Logit reward config: {logit_reward_config}")
     # import ipdb;ipdb.set_trace()
 
     # Load the dataset

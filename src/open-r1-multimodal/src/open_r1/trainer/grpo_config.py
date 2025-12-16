@@ -354,6 +354,45 @@ class GRPOConfig(TrainingArguments):
         },
     )
 
+    # Parameters that control logit-based reward
+    use_logit_reward: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use logit-based coherence/perception reward. When enabled, computes information "
+            "gain from reasoning process and multimodal inputs."
+        },
+    )
+    use_coherence_reward: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to use coherence reward (r_coh = S_full - S_no_think). Only effective when "
+            "use_logit_reward is True."
+        },
+    )
+    use_perception_reward: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to use perception reward (r_prcp = S_full - S_masked). Only effective when "
+            "use_logit_reward is True."
+        },
+    )
+    logit_reward_alpha: float = field(
+        default=0.1,
+        metadata={"help": "Weight for coherence reward. Only effective when use_logit_reward is True."},
+    )
+    logit_reward_beta: float = field(
+        default=0.1,
+        metadata={"help": "Weight for perception reward. Only effective when use_logit_reward is True."},
+    )
+    logit_reward_normalize: bool = field(
+        default=False,
+        metadata={"help": "Whether to normalize logit-based rewards before adding to total reward."},
+    )
+    emotion_wheel_root: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to emotion wheel data directory. If None, uses default path."},
+    )
+
     # Parameters that control the logging
     log_completions: bool = field(
         default=False,
