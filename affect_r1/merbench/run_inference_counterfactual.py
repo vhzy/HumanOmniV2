@@ -21,6 +21,13 @@ OPEN_R1_SRC = REPO_ROOT / "src" / "open-r1-multimodal" / "src"
 if OPEN_R1_SRC.exists():
     sys.path.insert(0, str(OPEN_R1_SRC))
 
+# Import PAPO masking utilities
+AFFECT_R1_ROOT = REPO_ROOT / "affect_r1"
+if AFFECT_R1_ROOT.exists():
+    sys.path.insert(0, str(AFFECT_R1_ROOT))
+
+from papo_utils import mask_all_multimodal, mask_visual_inputs, mask_audio_inputs
+
 try:
     from merbench.prompts import AFFECT_SYSTEM_PROMPT
 except Exception:  # pragma: no cover
@@ -79,9 +86,6 @@ def load_config(args):
         except Exception as err:
             print(f"[WARN] Failed to import config from {args.affectgpt_root}: {err}")
     cfg = create_local_config(args.dataset_root)
-    # Ensure paths are updated for local config too if needed, though create_local_config might need its own handling
-    # or we call update_affectgpt_paths on it as well if it follows the same structure.
-    # Assuming create_local_config returns a module-like object that update_affectgpt_paths can handle:
     update_affectgpt_paths(cfg, args.dataset_root, use_face_video=args.use_face_video)
     return cfg
 
@@ -153,28 +157,93 @@ def find_media(base_dir: str, name: str, extensions):
     return None
 
 
-def build_prompt_text(subtitle: str) -> str:
-    # Matches _make_conversation_image_and_video logic in grpo_qwenomni.py
-    subtitle_prompt = ""
-    if subtitle and subtitle.strip():
-        subtitle_prompt = f"\nThe subtitle of this video is: <Subtitle>{subtitle.strip()}</Subtitle>."
+def build_prompt_text(subtitle: str, early_answer: bool = False, 
+                      mask_modality: str = "none", prompt_mode: str = "default") -> str:
+    """
+    Build prompt text with optional early answer mode and prompt customization.
     
-    question = (
-        "As an expert in the field of emotions, please focus on the facial expressions, body movements, tone, "
-        "subtitle content, etc., in the video to discern clues related to the emotions of the individual. "
-        "Please provide a detailed description and ultimately predict the emotional state of the individual in the video."
-    )
-    
-    type_template = " Please provide the words to describe emotions within the  <answer> </answer> tags."
-    
-    # In training: text_prompt = f"{subtitle_prompt}\n{question}\n" + self.TYPE_TEMPLATE[...]
-    return f"{subtitle_prompt}\n{question}\n{type_template}"
+    Args:
+        subtitle: Subtitle text
+        early_answer: Not used here - early answer is handled by adding assistant message
+        mask_modality: Type of masking applied (none, all, visual, audio)
+        prompt_mode: Prompt mode - "default" (original prompt) or "ask_masked" (ask about masked modality)
+        
+    Returns:
+        Formatted prompt text
+    """
+    # Choose question based on prompt_mode and mask_modality
+
+    if prompt_mode == "ask_masked" and mask_modality in ["visual", "audio"]:
+        # Ask_masked mode: simple and direct, no subtitle, no type_template
+        if mask_modality == "visual":
+            # When visual is masked, explicitly ask what they can see
+            question = (
+                "Can you see any visual information in the video? Answer Yes or No."
+            )
+        elif mask_modality == "audio":
+            # When audio is masked, explicitly ask what they can hear
+            question = (
+                "Can you hear any audio in the video? Answer Yes or No."
+            )
+        # For ask_masked mode: only return the question, no subtitle, no type_template
+        return question
+    else:
+        # Default mode: original behavior with subtitle and type_template
+        subtitle_prompt = ""
+        if subtitle and subtitle.strip():
+            subtitle_prompt = f"\nThe subtitle of this video is: <Subtitle>{subtitle.strip()}</Subtitle>."
+        
+        question = (
+            "As an expert in the field of emotions, please focus on the facial expressions, body movements, tone, "
+            "subtitle content, etc., in the video to discern clues related to the emotions of the individual. "
+            "Please provide a detailed description and ultimately predict the emotional state of the individual in the video."
+        )
+        
+        type_template = " Please provide the words to describe emotions within the  <answer> </answer> tags."
+        
+        # Build the prompt
+        prompt = f"{subtitle_prompt}\n{question}\n{type_template}"
+        
+        return prompt
 
 
-def build_messages(video_path: str, audio_path: str, subtitle: str, use_audio_in_video: bool = False):
-    text_prompt = build_prompt_text(subtitle)
+def build_messages(video_path: str, audio_path: str, subtitle: str, 
+                   use_audio_in_video: bool = False, early_answer: bool = False,
+                   mask_modality: str = "none", prompt_mode: str = "default"):
+    """
+    Build messages for model input with optional early answer mode and prompt customization.
     
-    # Matches logic in grpo_qwenomni.py lines 285-370
+    Args:
+        video_path: Path to video file
+        audio_path: Path to audio file
+        subtitle: Subtitle text
+        use_audio_in_video: Whether to use audio from video
+        early_answer: Whether to use early answer mode
+        mask_modality: Type of masking applied (none, all, visual, audio)
+        prompt_mode: Prompt mode - "default" or "ask_masked"
+        
+    Returns:
+        List of message dictionaries
+    """
+    text_prompt = build_prompt_text(subtitle, early_answer=early_answer, 
+                                    mask_modality=mask_modality, prompt_mode=prompt_mode)
+    
+    # Choose system prompt based on prompt_mode
+    if prompt_mode == "ask_masked":
+        # Simple system prompt for ask_masked mode
+        system_prompt = "You are a helpful assistant."
+    else:
+        # Original affect system prompt for default mode
+        system_prompt = AFFECT_SYSTEM_PROMPT
+    
+    # Prepare text prefix based on prompt_mode
+    if prompt_mode == "ask_masked" :
+        # Ask_masked mode: no prefix, just the question
+        text_prefix = ""
+    else:
+        # Default mode: use descriptive prefix
+        text_prefix = "Here is a video, with the audio from the video.\n"
+    
     if use_audio_in_video:
         has_separate_audio = (audio_path is not None and audio_path != video_path)
         
@@ -183,7 +252,7 @@ def build_messages(video_path: str, audio_path: str, subtitle: str, use_audio_in
             content = [
                 {"type": "video", "video": video_path},
                 {"type": "audio", "audio": audio_path},
-                {"type": "text", "text": f"Here is a video, with the audio from the video.\n" + text_prompt}
+                {"type": "text", "text": text_prefix + text_prompt}
             ]
         else:
             # Case 2: Audio from video
@@ -194,14 +263,23 @@ def build_messages(video_path: str, audio_path: str, subtitle: str, use_audio_in
             if video_audio_available:
                 content = [
                     {"type": "video", "video": video_path},
-                    {"type": "audio", "audio": video_path}, # Training uses video path as audio source here
-                    {"type": "text", "text": f"Here is a video, with the audio from the video.\n" + text_prompt}
+                    {"type": "audio", "audio": video_path},
+                    {"type": "text", "text": text_prefix + text_prompt}
                 ]
             else:
-                content = [
-                    {"type": "video", "video": video_path},
-                    {"type": "text", "text": f"Here is the video, and there is no audio information, you don't need to process the audio.\n" + text_prompt}
-                ]
+                # No audio available
+                if prompt_mode == "ask_masked" :
+                    # Ask_masked mode: just use the prompt
+                    content = [
+                        {"type": "video", "video": video_path},
+                        {"type": "text", "text": text_prompt}
+                    ]
+                else:
+                    # Default mode: mention no audio
+                    content = [
+                        {"type": "video", "video": video_path},
+                        {"type": "text", "text": f"Here is the video, and there is no audio information, you don't need to process the audio.\n" + text_prompt}
+                    ]
     else:
         # Case 3: No audio used
         content = [
@@ -209,18 +287,44 @@ def build_messages(video_path: str, audio_path: str, subtitle: str, use_audio_in
             {"type": "text", "text": text_prompt}
         ]
 
-    return [
-        {"role": "system", "content": [{"type": "text", "text": AFFECT_SYSTEM_PROMPT}]},
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
         {"role": "user", "content": content},
     ]
+    
+    # Early answer mode: Add assistant message with <think> </think><answer> prefix
+    # This will be placed after <|im_start|>assistant\n in the chat template
+    if early_answer:
+        messages.append({
+            "role": "assistant", 
+            "content": [{"type": "text", "text": "<think> </think><answer>"}]
+        })
+    
+    return messages
 
 
 def prepare_inputs(processor, messages, use_audio_in_video):
     audios, images, videos = process_mm_info(messages, use_audio_in_video=use_audio_in_video)
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    
+    # If last message is from assistant (early answer mode), don't add generation prompt
+    # The assistant message already contains the prefix we want
+    has_assistant_message = messages[-1]["role"] == "assistant"
+    add_gen_prompt = not has_assistant_message
+    
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_gen_prompt)
     # Ensure text is a string (apply_chat_template might return a list)
     if isinstance(text, list):
         text = text[0] if len(text) > 0 else ""
+    
+    # For early answer mode: remove the trailing <|im_end|> tag
+    # We want the model to continue generating from the prefilled <answer> tag
+    if has_assistant_message:
+        # Remove <|im_end|>\n from the end
+        if text.endswith("<|im_end|>\n"):
+            text = text[:-len("<|im_end|>\n")]
+        elif text.endswith("<|im_end|>"):
+            text = text[:-len("<|im_end|>")]
+    
     inputs = processor(
         text=[text],
         images=images,
@@ -233,8 +337,40 @@ def prepare_inputs(processor, messages, use_audio_in_video):
     return inputs
 
 
+def apply_counterfactual_mask(model_inputs: dict, mask_modality: str, 
+                              mask_ratio: float, mask_noise: bool) -> dict:
+    """
+    Apply counterfactual masking to model inputs.
+    
+    Args:
+        model_inputs: Dictionary of model inputs
+        mask_modality: Type of masking ("none", "all", "visual", "audio")
+        mask_ratio: Ratio of features to mask (0-1)
+        mask_noise: Whether to use noise instead of zeros
+        
+    Returns:
+        Dictionary with masked inputs
+    """
+    if mask_modality == "none":
+        return model_inputs
+    
+    elif mask_modality == "all":
+        return mask_all_multimodal(model_inputs, mask_ratio=mask_ratio, noise=mask_noise)
+    
+    elif mask_modality == "visual":
+        return mask_visual_inputs(model_inputs, mask_ratio=mask_ratio, noise=mask_noise)
+    
+    elif mask_modality == "audio":
+        return mask_audio_inputs(model_inputs, mask_ratio=mask_ratio, noise=mask_noise)
+    
+    else:
+        raise ValueError(f"Unknown mask_modality: {mask_modality}")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Run MER-UniBench inference and store JSONL results.")
+    parser = argparse.ArgumentParser(description="Run MER-UniBench counterfactual inference with causal interventions.")
+    
+    # Original arguments
     parser.add_argument("--model-path", required=True, help="Path to finetuned Qwen2.5-Omni checkpoint.")
     parser.add_argument("--processor-path", default=None, help="Optional processor path (defaults to model).")
     parser.add_argument("--affectgpt-root", default=None, help="Optional path to AffectGPT/AffectGPT directory.")
@@ -249,9 +385,33 @@ def main():
     parser.add_argument("--do-sample", action="store_true", default=False)
     parser.add_argument("--use-audio-in-video", action="store_true", default=False)
     parser.add_argument("--use-face-video", action="store_true", default=False, help="Use processed face videos (video_face) if available.")
+    
+    # Counterfactual intervention arguments
+    parser.add_argument("--mask-modality", 
+                       choices=["none", "all", "visual", "audio"], 
+                       default="none",
+                       help="Type of modality masking: none (no mask), all (both), visual (video only), audio (audio only)")
+    parser.add_argument("--mask-ratio", 
+                       type=float, 
+                       default=0.9,
+                       help="Ratio of features to mask (default: 0.9 = 90%%)")
+    parser.add_argument("--mask-noise", 
+                       action="store_true", 
+                       default=False,
+                       help="Use noise instead of zeros for masking")
+    parser.add_argument("--early-answer", 
+                       action="store_true", 
+                       default=False,
+                       help="Use early answer mode (add empty <think></think> in prompt)")
+    parser.add_argument("--prompt-mode",
+                       choices=["default", "ask_masked"],
+                       default="default",
+                       help="Prompt mode: 'default' (original prompt) or 'ask_masked' (explicitly ask about masked modality)")
+    
     args = parser.parse_args()
 
     processor_path = args.processor_path or args.model_path
+    
     # Try to use flash_attention_2 if available, otherwise fall back to default
     try:
         import importlib.util
@@ -261,6 +421,15 @@ def main():
         attn_impl = "flash_attention_2"
     except ImportError:
         attn_impl = "sdpa"  # Use SDPA as fallback
+    
+    print("=" * 80)
+    print("Counterfactual Inference Configuration:")
+    print(f"  Mask Modality: {args.mask_modality}")
+    print(f"  Mask Ratio: {args.mask_ratio}")
+    print(f"  Mask Noise: {args.mask_noise}")
+    print(f"  Early Answer: {args.early_answer}")
+    print("=" * 80)
+    
     model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
         args.model_path,
         torch_dtype=torch.bfloat16,
@@ -282,15 +451,27 @@ def main():
         video_dir = config_module.PATH_TO_RAW_VIDEO.get(dataset, "")
         audio_dir = config_module.PATH_TO_RAW_AUDIO.get(dataset, "")
 
+        # Store counterfactual configuration in metadata
+        extra_metadata = {
+            "model_path": args.model_path,
+            "counterfactual_config": {
+                "mask_modality": args.mask_modality,
+                "mask_ratio": args.mask_ratio,
+                "mask_noise": args.mask_noise,
+                "early_answer": args.early_answer,
+                "prompt_mode": args.prompt_mode,
+            }
+        }
+
         writer = MerBenchResultWriter(
             output_root=args.output_root,
             dataset=dataset,
             run_name=args.run_name,
             checkpoint_name=args.checkpoint_name,
-            extra_metadata={"model_path": args.model_path},
+            extra_metadata=extra_metadata,
         )
         try:
-            progress = tqdm(test_names, desc=f"{dataset} inference")
+            progress = tqdm(test_names, desc=f"{dataset} counterfactual inference")
             for name in progress:
                 video_path = find_media(video_dir, name, [".mp4", ".avi", ".mkv"])
                 audio_path = find_media(audio_dir, name, [".wav", ".mp3"])
@@ -300,34 +481,28 @@ def main():
 
                 subtitle = subtitles.get(name, "")
                 
-                # Logic update:
-                # If use_audio_in_video is True:
-                #   We don't need to force audio_path = video_path here manually because build_messages handles it
-                #   based on the flag and video_path presence.
-                # However, for "separate audio" detection, we need to know if the found audio_path 
-                # is actually a separate file or just us falling back.
-                
-                # In find_media, audio_path is found from audio_dir. 
-                # If audio_dir is different or file is different, it is separate.
-                # If find_media returns None, and we used to set it to video_path...
-                
-                # Let's KEEP audio_path as the "found separate audio file" (or None).
-                # And pass the flag to build_messages.
-                
-                # But wait, original code did:
-                # if audio_path is None and args.use_audio_in_video and video_path: audio_path = video_path
-                # We should REMOVE this overwrite so build_messages knows it's NOT a separate file.
-                
-                messages = build_messages(video_path, audio_path, subtitle, use_audio_in_video=args.use_audio_in_video)
-                
-                # We also need to correct the 'use_audio_in_video' flag passed to prepare_inputs/process_mm_info
-                # to match training logic: False if separate audio exists, else True (if global flag is True).
+                # Build messages with early_answer flag and prompt_mode
+                messages = build_messages(
+                    video_path, audio_path, subtitle, 
+                    use_audio_in_video=args.use_audio_in_video,
+                    early_answer=args.early_answer,
+                    mask_modality=args.mask_modality,
+                    prompt_mode=args.prompt_mode
+                )
                 
                 has_separate_audio = (audio_path is not None)
                 use_audio_in_video_for_processing = False if has_separate_audio else args.use_audio_in_video
                 
                 model_inputs = prepare_inputs(processor, messages, use_audio_in_video_for_processing)
                 model_inputs = {k: v.to(model.device) for k, v in model_inputs.items()}
+
+                # Apply counterfactual masking
+                model_inputs = apply_counterfactual_mask(
+                    model_inputs, 
+                    mask_modality=args.mask_modality,
+                    mask_ratio=args.mask_ratio,
+                    mask_noise=args.mask_noise
+                )
 
                 with torch.inference_mode():
                     outputs = model.generate(
@@ -336,7 +511,7 @@ def main():
                         do_sample=args.do_sample,
                         temperature=args.temperature,
                         top_p=args.top_p,
-                        use_audio_in_video=use_audio_in_video_for_processing,  # 必须与输入处理时保持一致
+                        use_audio_in_video=use_audio_in_video_for_processing,  # 使用与输入处理一致的参数
                     )
                 input_len = model_inputs["input_ids"].shape[-1]
                 generated = outputs[0]
@@ -346,6 +521,12 @@ def main():
                     skip_special_tokens=True,
                     clean_up_tokenization_spaces=False,
                 )
+                
+                # For early answer mode: prepend the prefilled content to make complete format
+                # The model only generates the continuation, but we need the full response for parsing
+                if args.early_answer:
+                    response = "<think> </think><answer>" + response
+                
                 writer.log_sample(
                     name=name,
                     response_text=response,

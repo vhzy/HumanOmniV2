@@ -34,6 +34,7 @@ class LogitRewardConfig:
     alpha: float = 0.1                  # coherence reward 权重
     beta: float = 0.1                   # perception reward 权重
     use_max_for_neg: bool = False        # 非 GT 类别是否使用 max 聚合
+    use_neg_contrast: bool = True       # 是否使用负样本对比: True=(S_GT_with-S_GT_no)-(S_Neg_with-S_Neg_no), False=S_GT_with-S_GT_no
     normalize_rewards: bool = False     # 是否归一化 reward
     mapping_depth: str = "full"         # 映射深度: wheel_only, wheel_synonym, full
     cache_path: Optional[str] = None    # Token 映射表缓存路径
@@ -242,10 +243,13 @@ class LogitRewardComputer:
         """
         构建移除推理过程的输入（用于 Coherence Counterfactual）
         
-        策略：用正则表达式替换 <think>...</think> 为 <think></think>
+        策略：文本替换后重新编码整个序列
         
-        原始：... <think>长推理内容</think><answer>...
-        结果：... <think></think><answer>...
+        注意：由于 tokenizer 边界合并行为，两个版本的 answer token ids 可能不完全相同。
+        但 answer **文本内容** 完全相同，后续计算时会分别找锚点位置来对齐。
+        
+        原始：... <think>长推理内容</think><answer>内容</answer>
+        结果：... <think></think><answer>内容</answer>（文本内容相同）
         """
         import re
         
@@ -263,7 +267,6 @@ class LogitRewardComputer:
             text = self.tokenizer.decode(ids.tolist(), skip_special_tokens=False)
             
             # 2. 用正则表达式替换最后一个 <think>...</think> 为 <think></think>
-            # 注意：prompt 中可能有 <think> </think> 示例，我们需要替换最后一个（assistant 回复中的）
             pattern = r'<think>.*?</think>'
             matches = list(re.finditer(pattern, text, flags=re.DOTALL))
             
@@ -276,7 +279,6 @@ class LogitRewardComputer:
             
             # 3. 检查是否有替换发生
             if new_text == text:
-                # 没有找到 think 块，保持原样
                 new_input_ids_list.append(ids)
                 new_attention_mask_list.append(mask)
                 continue
@@ -285,7 +287,6 @@ class LogitRewardComputer:
             new_ids = self.tokenizer.encode(new_text, add_special_tokens=False, return_tensors="pt")[0]
             new_ids = new_ids.to(device=device, dtype=ids.dtype)
             
-            # 5. 创建对应的 attention mask
             new_mask = torch.ones(len(new_ids), dtype=mask.dtype, device=device)
             
             new_input_ids_list.append(new_ids)
@@ -463,16 +464,29 @@ class LogitRewardComputer:
         
         # 3. Forward C: Coherence Counterfactual (如果启用)
         logits_C = None
+        no_think_answer_ids_list = None  # 保存 no-think 版本的 answer token ids
         if self.config.use_coherence_reward:
             try:
                 no_think_ids, no_think_mask = self._build_no_think_input(input_ids, attention_mask)
                 
                 no_think_answer_starts = []
                 no_think_answer_ends = []
+                no_think_answer_ids_list = []  # 提取 no-think 版本的 answer token ids
+                
                 for b in range(batch_size):
                     start, end = self._extract_answer_region(no_think_ids[b])
                     no_think_answer_starts.append(start)
                     no_think_answer_ends.append(end)
+                    
+                    # 提取 no-think 版本的 answer token ids
+                    if start >= 0 and end > start:
+                        answer_ids_no_think = no_think_ids[b, start:end].tolist()
+                        # 去掉 padding
+                        pad_id = self.tokenizer.pad_token_id or 0
+                        answer_ids_no_think = [t for t in answer_ids_no_think if t != pad_id]
+                    else:
+                        answer_ids_no_think = []
+                    no_think_answer_ids_list.append(answer_ids_no_think)
                 
                 logits_C = self._get_answer_logits(
                     model, no_think_ids, no_think_mask, multimodal_inputs,
@@ -481,6 +495,7 @@ class LogitRewardComputer:
             except Exception as e:
                 print(f"[LogitReward WARNING] Coherence forward failed, skipping: {e}")
                 logits_C = None
+                no_think_answer_ids_list = None
         
         # 4. Forward B: Perception Counterfactual (如果启用)
         logits_B = None
@@ -497,12 +512,50 @@ class LogitRewardComputer:
                 print(f"[LogitReward WARNING] Perception forward failed, skipping: {e}")
                 logits_B = None
         
+        # 格式错误惩罚值（比正常负值更负）
+        FORMAT_ERROR_PENALTY = -5.0
+        
+        def _extract_answer_from_quotes(text: str) -> Optional[str]:
+            """
+            从文本的最后一个引号对中提取答案
+            
+            例如：<answer"happiness, excitement, nostalgia" -> happiness, excitement, nostalgia
+            """
+            import re
+            # 找最后一个引号对（双引号或单引号）
+            # 优先找双引号
+            double_quotes = list(re.finditer(r'"([^"]*)"', text))
+            if double_quotes:
+                return double_quotes[-1].group(1)
+            
+            # 尝试单引号
+            single_quotes = list(re.finditer(r"'([^']*)'", text))
+            if single_quotes:
+                return single_quotes[-1].group(1)
+            
+            return None
+        
+        def _rebuild_answer_from_text(answer_content: str) -> Tuple[List[int], torch.Tensor]:
+            """
+            根据从引号中提取的答案内容，重新构建 token ids 和 anchor mask
+            """
+            # 编码答案内容
+            new_answer_ids = self.tokenizer.encode(answer_content, add_special_tokens=False)
+            new_answer_tensor = torch.tensor(new_answer_ids, device=device)
+            new_anchor_mask = self.token_map.build_anchor_mask(new_answer_tensor)
+            return new_answer_ids, new_anchor_mask
+        
         # 5. 计算每个样本的 reward（使用多 wheel 计算）
+        skip_stats = {"no_answer": 0, "no_gt": 0, "no_anchor": 0, "computed": 0, "format_error": 0}
         for b in range(batch_size):
             answer_ids = answer_token_ids_list[b]
             gt_words = gt_categories_list[b]
             
-            if len(answer_ids) == 0 or len(gt_words) == 0:
+            if len(answer_ids) == 0:
+                skip_stats["no_answer"] += 1
+                continue
+            if len(gt_words) == 0:
+                skip_stats["no_gt"] += 1
                 continue
             
             actual_len = len(answer_ids)
@@ -511,23 +564,101 @@ class LogitRewardComputer:
             anchor_mask = self.token_map.build_anchor_mask(answer_ids)
             
             if anchor_mask.sum() == 0:
+                skip_stats["no_anchor"] += 1
                 continue
             
             # 提取该样本的 logits
             sample_logits_A = logits_A[b, :actual_len]  # Full State
+            num_anchors_with = int(anchor_mask.sum().item())
             
             # 计算 coherence reward:
             # Gain(t) = [S(GT)_Full - S(GT)_NoThink] - [S(Neg)_Full - S(Neg)_NoThink]
             # r_coh = mean_t(Gain(t))
-            if self.config.use_coherence_reward and logits_C is not None:
-                sample_logits_C = logits_C[b, :actual_len]  # No-Think
+            if self.config.use_coherence_reward and logits_C is not None and no_think_answer_ids_list is not None:
+                # 获取 no-think 版本的 answer token ids 和 logits
+                answer_ids_no_think = no_think_answer_ids_list[b]
+                actual_len_no_think = len(answer_ids_no_think)
                 
-                # 使用 compute_sequence_reward 按公式计算
-                # 这里 logits_A 是 with-think, logits_C 是 no-think
-                coherence_reward = self._compute_sequence_gain(
-                    sample_logits_A, sample_logits_C, anchor_mask, gt_words
-                )
-                coherence_rewards[b] = coherence_reward
+                if actual_len_no_think == 0:
+                    # no-think 版本没有有效的 answer，设置惩罚值
+                    skip_stats["format_error"] += 1
+                    coherence_rewards[b] = FORMAT_ERROR_PENALTY
+                    continue
+                
+                sample_logits_C = logits_C[b, :actual_len_no_think]  # No-Think
+                
+                # 为 no-think 版本构建独立的 anchor mask
+                answer_ids_no_think_tensor = torch.tensor(answer_ids_no_think, device=device)
+                anchor_mask_no_think = self.token_map.build_anchor_mask(answer_ids_no_think_tensor)
+                num_anchors_no = int(anchor_mask_no_think.sum().item())
+                
+                if anchor_mask_no_think.sum() == 0:
+                    skip_stats["format_error"] += 1
+                    coherence_rewards[b] = FORMAT_ERROR_PENALTY
+                    continue
+                
+                # 快速路径：锚点数量一致，正常计算
+                if num_anchors_with == num_anchors_no:
+                    skip_stats["computed"] += 1
+                    coherence_reward = self._compute_sequence_gain_paired(
+                        sample_logits_A, anchor_mask,
+                        sample_logits_C, anchor_mask_no_think,
+                        gt_words, self.config.use_neg_contrast
+                    )
+                    coherence_rewards[b] = coherence_reward
+                else:
+                    # 慢速路径：锚点数量不一致，尝试从引号中恢复答案
+                    answer_text_with = self.tokenizer.decode(answer_ids, skip_special_tokens=False)
+                    answer_text_no = self.tokenizer.decode(answer_ids_no_think, skip_special_tokens=False)
+                    
+                    # print(f"[LogitReward] Sample {b}: anchor mismatch detected, trying to recover...")
+                    # print(f"  with_think: {num_anchors_with} anchors, len={len(answer_ids)} tokens")
+                    # print(f"  no_think:   {num_anchors_no} anchors, len={len(answer_ids_no_think)} tokens")
+                    
+                    # 尝试从引号中提取真正的答案
+                    recovered_with = _extract_answer_from_quotes(answer_text_with)
+                    recovered_no = _extract_answer_from_quotes(answer_text_no)
+                    
+                    if recovered_with and recovered_no:
+                        # print(f"  Recovered from quotes:")
+                        # print(f"    with_think: \"{recovered_with}\"")
+                        # print(f"    no_think:   \"{recovered_no}\"")
+                        
+                        # 重新构建 anchor mask（基于恢复的文本）
+                        new_with_ids, new_anchor_with = _rebuild_answer_from_text(recovered_with)
+                        new_no_ids, new_anchor_no = _rebuild_answer_from_text(recovered_no)
+                        
+                        new_num_with = int(new_anchor_with.sum().item())
+                        new_num_no = int(new_anchor_no.sum().item())
+                        
+                        if new_num_with == new_num_no and new_num_with > 0:
+                            # print(f"  Recovery successful! Both have {new_num_with} anchors")
+                            skip_stats["computed"] += 1
+                            
+                            # 注意：使用恢复的 anchor mask 进行计算
+                            # 但 logits 仍然使用原始的（因为 logits 是基于原始 token 序列的）
+                            # 这里我们只能使用 min(num_anchors_with, num_anchors_no) 个锚点
+                            # 因为 logits 的位置和恢复的 token 位置不对应
+                            # 所以这里采用保守策略：使用原始的较少锚点数
+                            min_anchors = min(num_anchors_with, num_anchors_no)
+                            coherence_reward = self._compute_sequence_gain_paired_safe(
+                                sample_logits_A, anchor_mask,
+                                sample_logits_C, anchor_mask_no_think,
+                                gt_words, self.config.use_neg_contrast,
+                                max_anchors=min_anchors
+                            )
+                            coherence_rewards[b] = coherence_reward
+                        else:
+                            # print(f"  Recovery failed: new anchors still mismatch ({new_num_with} vs {new_num_no})")
+                            skip_stats["format_error"] += 1
+                            coherence_rewards[b] = FORMAT_ERROR_PENALTY
+                    else:
+                        # 无法从引号中恢复，打印详细信息
+                        # print(f"  Cannot recover from quotes:")
+                        # print(f"    with_think text: \"{answer_text_with[:100]}...\"" if len(answer_text_with) > 100 else f"    with_think text: \"{answer_text_with}\"")
+                        # print(f"    no_think text:   \"{answer_text_no[:100]}...\"" if len(answer_text_no) > 100 else f"    no_think text:   \"{answer_text_no}\"")
+                        skip_stats["format_error"] += 1
+                        coherence_rewards[b] = FORMAT_ERROR_PENALTY
             
             # 计算 perception reward:
             # Gain(t) = [S(GT)_Full - S(GT)_NoMM] - [S(Neg)_Full - S(Neg)_NoMM]
@@ -536,31 +667,100 @@ class LogitRewardComputer:
                 sample_logits_B = logits_B[b, :actual_len]  # No-MM
                 
                 perception_reward = self._compute_sequence_gain(
-                    sample_logits_A, sample_logits_B, anchor_mask, gt_words
+                    sample_logits_A, sample_logits_B, anchor_mask, gt_words,
+                    self.config.use_neg_contrast
                 )
                 perception_rewards[b] = perception_reward
             
             # 记录 Full State 得分
             scores_A[b] = self._compute_sample_gt_score(sample_logits_A, anchor_mask, gt_words)
         
-        # 6. 归一化（可选）
+        # 6. 打印统计信息（帮助诊断问题）
+        print(f"[LogitReward] Sample stats: computed={skip_stats['computed']}, "
+              f"format_error={skip_stats['format_error']}, "
+              f"no_answer={skip_stats['no_answer']}, no_gt={skip_stats['no_gt']}, no_anchor={skip_stats['no_anchor']}")
+        if skip_stats['computed'] > 0:
+            print(f"[LogitReward] coherence: mean={coherence_rewards.mean().item():.4f}, "
+                  f"std={coherence_rewards.std().item():.4f}, "
+                  f"non-zero={((coherence_rewards != 0).sum().item())}/{batch_size}")
+        
+        # 7. 归一化（可选）
         if self.config.normalize_rewards:
             if coherence_rewards.std() > 1e-6:
                 coherence_rewards = (coherence_rewards - coherence_rewards.mean()) / (coherence_rewards.std() + 1e-6)
             if perception_rewards.std() > 1e-6:
                 perception_rewards = (perception_rewards - perception_rewards.mean()) / (perception_rewards.std() + 1e-6)
         
-        # 7. 计算总 reward
+        # 8. 计算总 reward
         total_rewards = (
             self.config.alpha * coherence_rewards +
             self.config.beta * perception_rewards
         )
+        
+        # 9. 同时计算另一种 use_neg_contrast 模式的 coherence reward（用于对比记录）
+        coherence_rewards_contrast = torch.zeros(batch_size, device=device)
+        coherence_rewards_no_contrast = torch.zeros(batch_size, device=device)
+        
+        # 重新遍历计算两种方式的 coherence reward
+        if self.config.use_coherence_reward and logits_C is not None and no_think_answer_ids_list is not None:
+            for b in range(batch_size):
+                answer_ids = answer_token_ids_list[b]
+                gt_words = gt_categories_list[b]
+                
+                if len(answer_ids) == 0 or len(gt_words) == 0:
+                    continue
+                
+                actual_len = len(answer_ids)
+                anchor_mask = self.token_map.build_anchor_mask(answer_ids)
+                
+                if anchor_mask.sum() == 0:
+                    continue
+                
+                sample_logits_A = logits_A[b, :actual_len]
+                answer_ids_no_think = no_think_answer_ids_list[b]
+                actual_len_no_think = len(answer_ids_no_think)
+                
+                if actual_len_no_think > 0:
+                    sample_logits_C = logits_C[b, :actual_len_no_think]
+                    answer_ids_no_think_tensor = torch.tensor(answer_ids_no_think, device=device)
+                    anchor_mask_no_think = self.token_map.build_anchor_mask(answer_ids_no_think_tensor)
+                    
+                    if anchor_mask_no_think.sum() > 0:
+                        num_anchors_with = int(anchor_mask.sum().item())
+                        num_anchors_no = int(anchor_mask_no_think.sum().item())
+                        
+                        if num_anchors_with == num_anchors_no:
+                            coherence_rewards_contrast[b] = self._compute_sequence_gain_paired(
+                                sample_logits_A, anchor_mask,
+                                sample_logits_C, anchor_mask_no_think,
+                                gt_words, use_neg_contrast=True
+                            )
+                            coherence_rewards_no_contrast[b] = self._compute_sequence_gain_paired(
+                                sample_logits_A, anchor_mask,
+                                sample_logits_C, anchor_mask_no_think,
+                                gt_words, use_neg_contrast=False
+                            )
+                        else:
+                            min_anchors = min(num_anchors_with, num_anchors_no)
+                            coherence_rewards_contrast[b] = self._compute_sequence_gain_paired_safe(
+                                sample_logits_A, anchor_mask,
+                                sample_logits_C, anchor_mask_no_think,
+                                gt_words, use_neg_contrast=True, max_anchors=min_anchors
+                            )
+                            coherence_rewards_no_contrast[b] = self._compute_sequence_gain_paired_safe(
+                                sample_logits_A, anchor_mask,
+                                sample_logits_C, anchor_mask_no_think,
+                                gt_words, use_neg_contrast=False, max_anchors=min_anchors
+                            )
         
         return {
             "coherence": coherence_rewards,
             "perception": perception_rewards,
             "total": total_rewards,
             "score_full": scores_A,
+            # 额外返回两种方式的 coherence reward（用于 wandb 对比记录）
+            "coherence_contrast": coherence_rewards_contrast,
+            "coherence_no_contrast": coherence_rewards_no_contrast,
         }
     
     def _compute_sequence_gain(
@@ -569,12 +769,17 @@ class LogitRewardComputer:
         logits_no: torch.Tensor,
         anchor_mask: torch.Tensor,
         gt_words: List[str],
+        use_neg_contrast: bool = True,
     ) -> torch.Tensor:
         """
         计算序列级别的增益差分
         
-        公式:
+        公式 (use_neg_contrast=True, 默认):
         Gain(t) = [S(GT, t)_with - S(GT, t)_no] - [S(Neg, t)_with - S(Neg, t)_no]
+        
+        公式 (use_neg_contrast=False):
+        Gain(t) = S(GT, t)_with - S(GT, t)_no
+        
         R = (1 / Σ M_t) * Σ_t (M_t · Gain(t))
         
         Args:
@@ -582,6 +787,7 @@ class LogitRewardComputer:
             logits_no: (seq_len, vocab_size) Without 条件的 logits
             anchor_mask: (seq_len,) 锚点 mask
             gt_words: GT 情感词列表
+            use_neg_contrast: 是否使用负样本对比
         
         Returns:
             reward: scalar
@@ -602,7 +808,8 @@ class LogitRewardComputer:
             gain = self.scorer.compute_multi_wheel_gain(
                 logits_with[t:t+1],  # (1, vocab_size)
                 logits_no[t:t+1],
-                gt_words
+                gt_words,
+                use_neg_contrast,
             )
             gains[t] = gain.squeeze()
         
@@ -612,6 +819,100 @@ class LogitRewardComputer:
         reward = masked_gains.sum() / mask_sum
         
         return reward
+    
+    def _compute_sequence_gain_paired(
+        self,
+        logits_with: torch.Tensor,
+        anchor_mask_with: torch.Tensor,
+        logits_no: torch.Tensor,
+        anchor_mask_no: torch.Tensor,
+        gt_words: List[str],
+        use_neg_contrast: bool = True,
+    ) -> torch.Tensor:
+        """
+        计算配对的序列增益差分（要求锚点数量一致）
+        """
+        return self._compute_sequence_gain_paired_safe(
+            logits_with, anchor_mask_with,
+            logits_no, anchor_mask_no,
+            gt_words, use_neg_contrast,
+            max_anchors=None
+        )
+    
+    def _compute_sequence_gain_paired_safe(
+        self,
+        logits_with: torch.Tensor,
+        anchor_mask_with: torch.Tensor,
+        logits_no: torch.Tensor,
+        anchor_mask_no: torch.Tensor,
+        gt_words: List[str],
+        use_neg_contrast: bool = True,
+        max_anchors: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        计算配对的序列增益差分（支持限制最大锚点数）
+        
+        两个版本的锚点位置可能不同（由于 tokenization 差异），
+        但情感词数量相同，所以按顺序配对计算。
+        
+        公式 (use_neg_contrast=True, 默认):
+        Gain(i) = [S(GT, pos_with[i]) - S(GT, pos_no[i])] - [S(Neg, pos_with[i]) - S(Neg, pos_no[i])]
+        
+        公式 (use_neg_contrast=False):
+        Gain(i) = S(GT, pos_with[i]) - S(GT, pos_no[i])
+        
+        Args:
+            logits_with: (seq_len_with, vocab_size) With-Think 的 logits
+            anchor_mask_with: (seq_len_with,) With-Think 的锚点 mask
+            logits_no: (seq_len_no, vocab_size) No-Think 的 logits
+            anchor_mask_no: (seq_len_no,) No-Think 的锚点 mask
+            gt_words: GT 情感词列表
+            use_neg_contrast: 是否使用负样本对比
+            max_anchors: 最大使用的锚点数（用于恢复模式）
+        
+        Returns:
+            reward: scalar
+        """
+        device = logits_with.device
+        
+        # 提取锚点位置
+        anchor_positions_with = (anchor_mask_with == 1).nonzero(as_tuple=True)[0].tolist()
+        anchor_positions_no = (anchor_mask_no == 1).nonzero(as_tuple=True)[0].tolist()
+        
+        # 确定使用的锚点数量
+        num_anchors = min(len(anchor_positions_with), len(anchor_positions_no))
+        if max_anchors is not None:
+            num_anchors = min(num_anchors, max_anchors)
+        
+        if num_anchors == 0:
+            return torch.tensor(0.0, device=device)
+        
+        gains = []
+        
+        for i in range(num_anchors):
+            pos_with = anchor_positions_with[i]
+            pos_no = anchor_positions_no[i]
+            
+            # 在各自的锚点位置计算增益
+            gain = self.scorer.compute_multi_wheel_gain(
+                logits_with[pos_with:pos_with+1],  # (1, vocab_size)
+                logits_no[pos_no:pos_no+1],        # (1, vocab_size)
+                gt_words,
+                use_neg_contrast,
+            )
+            
+            # 安全处理 gain
+            if gain.numel() == 0:
+                gains.append(0.0)
+            elif gain.numel() == 1:
+                gains.append(gain.item())
+            else:
+                gains.append(gain.squeeze().item())
+        
+        # 平均
+        reward = sum(gains) / len(gains) if gains else 0.0
+        
+        return torch.tensor(reward, device=device)
     
     def _compute_sample_gt_score(
         self,

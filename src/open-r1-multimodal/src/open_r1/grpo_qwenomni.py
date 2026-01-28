@@ -148,6 +148,59 @@ class GRPOScriptArguments(ScriptArguments):
         default=False,
         metadata={"help": "Maximum number of anyres blocks for the image (for InternVL)"},
     )
+    # PAPO (Perception-Aware Policy Optimization) arguments
+    # Default values aligned with original PAPO paper
+    papo_enabled: bool = field(
+        default=False,
+        metadata={"help": "Enable PAPO (Perception-Aware Policy Optimization)"},
+    )
+    papo_version: str = field(
+        default="v2",
+        metadata={"help": "PAPO version: v0 (mask both), v1 (mask separately), v2 (matrix-guided)"},
+    )
+    papo_mask_ratio: float = field(
+        default=0.6,
+        metadata={"help": "PAPO mask ratio (original PAPO uses 0.6 / 60% blackening)"},
+    )
+    papo_kl_coef: float = field(
+        default=0.001,
+        metadata={"help": "PAPO KL divergence coefficient (original PAPO: 1e-3)"},
+    )
+    papo_entropy_coef: float = field(
+        default=0.0002,
+        metadata={"help": "PAPO entropy regularization coefficient (original PAPO: 0.03)"},
+    )
+    papo_use_noise: bool = field(
+        default=False,
+        metadata={"help": "Use noise instead of zeros for masking (original PAPO uses zeros/black)"},
+    )
+    papo_routing_threshold: float = field(
+        default=0.5,
+        metadata={"help": "Routing threshold for V2 modality assignment"},
+    )
+    papo_kl_penalty: str = field(
+        default="kl",
+        metadata={"help": "PAPO KL penalty type: 'kl' (standard), 'low_var_kl' (low variance), 'abs', 'mse'"},
+    )
+    # 额外控制开关
+    format_gate_all: Optional[bool] = field(
+        default=False,
+        metadata={"help": "When True, if format reward fails, zero out all rewards for that sample."},
+    )
+    disable_stage2_rewards: Optional[bool] = field(
+        default=False,
+        metadata={"help": "When True, zero out format/perception/coherence stage2 rewards while keeping PAPO V2 routing."},
+    )
+    # Logit Reward scaling method
+    logit_reward_scale_method: Optional[str] = field(
+        default="tanh",
+        metadata={"help": "Logit reward scaling method: 'tanh' (smooth, [-1,1]) or 'clip' (hard, [-2,2])"},
+    )
+    # Logit Reward neg contrast - 使用字符串类型避免 bool 解析问题
+    logit_reward_use_neg_contrast: str = field(
+        default="true",
+        metadata={"help": "Whether to use neg contrast in logit reward: 'true'=(S_GT_with-S_GT_no)-(S_Neg_with-S_Neg_no), 'false'=S_GT_with-S_GT_no"},
+    )
 
 @dataclass
 class GRPOModelConfig(ModelConfig):
@@ -420,9 +473,10 @@ class LazySupervisedDataset(Dataset):
         if "path" in source:
             conversation = self._make_conversation_image_and_video(source, use_audio_in_video=self.use_audio_in_video)
             problem_type = source.get("problem_type", "emer_ov")  # Default for RL data
-            has_separate_audio = "audio_path" in source and source["audio_path"]
-            use_audio_in_video_for_processing = False if has_separate_audio else self.use_audio_in_video
-            audios, images, videos = process_mm_info(conversation, use_audio_in_video=use_audio_in_video_for_processing)
+            # 关键修复：_make_conversation_image_and_video 已经显式添加了 audio 元素
+            # 所以 process_mm_info 始终使用 False，避免重复从视频提取音频
+            # 这样只会处理显式的 {"type": "audio"} 元素
+            audios, images, videos = process_mm_info(conversation, use_audio_in_video=False)
 
         # RL data has 'openset', SFT data has 'solution'
         openset = source.get("openset")
@@ -437,7 +491,9 @@ class LazySupervisedDataset(Dataset):
             "openset": openset,  # For RL reward calculation
             "solution": solution,  # For SFT (if any)
             "problem_type": problem_type,
-            "use_audio_in_video": self.use_audio_in_video,
+            # 始终使用 False：音频已经通过显式的 {"type": "audio"} 元素处理
+            # processor 和 generate 必须使用相同的值以保证位置编码一致
+            "use_audio_in_video": False,
             # 透传 path 与已抽取线索，供自定义 reward 使用（Rubric 感知/连贯）
             "path": source.get("path"),
             "extracted_clues": source.get("extracted_clues"),
@@ -514,13 +570,46 @@ def main(script_args, training_args, model_args):
              raise ValueError(f"Reward function '{func_name}' not found in registry or as a module path.")
     
     # Store logit_reward_config in training_args for GRPOTrainer to use
+    # Also include scale_method for controlling how to limit reward range
+    # Only set scale_method if we actually have logit reward components
+    if logit_reward_config:
+        logit_reward_config['scale_method'] = script_args.logit_reward_scale_method
     training_args.logit_reward_config = logit_reward_config
     # Update reward_weights to only include non-logit rewards
     training_args.reward_weights = reward_weights
-             
+    # 传递格式兜底与禁用 stage2 奖励开关
+    training_args.format_gate_all = script_args.format_gate_all
+    training_args.disable_stage2_rewards = script_args.disable_stage2_rewards
+    
+    # ===================== PAPO Configuration =====================
+    # Build PAPO config from script_args
+    papo_config = {
+        "enabled": script_args.papo_enabled,
+        "version": script_args.papo_version,
+        "mask_ratio": script_args.papo_mask_ratio,
+        "use_noise": script_args.papo_use_noise,
+        "kl_coef": script_args.papo_kl_coef,
+        "entropy_coef": script_args.papo_entropy_coef,
+        "kl_penalty": script_args.papo_kl_penalty,  # 'kl', 'low_var_kl', 'abs', 'mse'
+        "routing_threshold": script_args.papo_routing_threshold,
+    }
+    training_args.papo_config = papo_config
+    
+    # 传递 logit_reward_use_neg_contrast 到 training_args (因为 trainer 只能访问 training_args)
+    training_args.logit_reward_use_neg_contrast = script_args.logit_reward_use_neg_contrast
+    
     print(f"[GRPO] reward_funcs: {script_args.reward_funcs}")
     print(f"[GRPO] Regular reward_funcs: {reward_funcs}, weights: {reward_weights}")
     print(f"[GRPO] Logit reward config: {logit_reward_config}")
+    print(f"[GRPO] Logit reward use_neg_contrast: {script_args.logit_reward_use_neg_contrast}")
+    print(f"[GRPO] PAPO config: {papo_config}")
+    
+    # 同步 affect_reward 的 score threshold 与 PAPO routing threshold
+    try:
+        import affect_r1.affect_reward as affect_reward
+        affect_reward.set_score_threshold(script_args.papo_routing_threshold)
+    except ImportError:
+        print("[GRPO] Warning: Could not import affect_reward to set score threshold")
     # import ipdb;ipdb.set_trace()
 
     # Load the dataset

@@ -32,7 +32,7 @@ WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_NAME="affect_r1_sft"
 MODEL_PATH="/mnt/afs/hanzhiyuan/huggingface/Qwen2.5-Omni-7B"
 DATA_CONFIG="/mnt/afs/hanzhiyuan/code/HumanOmniV2/affect_r1/data/sft_config.yaml"
-OUTPUT_DIR="/mnt/afs/hanzhiyuan/code/HumanOmniV2/affect_r1/output/sft_baseline_5k_2"
+OUTPUT_DIR="/mnt/afs/hanzhiyuan/code/HumanOmniV2/affect_r1/output/sft_baseline_10"
 DEEPSPEED_CONFIG="/mnt/afs/hanzhiyuan/code/HumanOmniV2/src/open-r1-multimodal/run_scripts/zero2.json"
 NPROC_PER_NODE=8
 
@@ -57,7 +57,7 @@ python -m torch.distributed.run --nproc_per_node $GPUS --nnodes=1 --node_rank=0 
     --dataset_name $DATA_CONFIG \
     --freeze_vision_modules true \
     --use_audio_in_video false \
-    --per_device_train_batch_size 2 \
+    --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 2 \
     --logging_steps 2 \
     --learning_rate 2e-5 \
@@ -69,7 +69,7 @@ python -m torch.distributed.run --nproc_per_node $GPUS --nnodes=1 --node_rank=0 
     --gradient_checkpointing true \
     --num_train_epochs 2 \
     --run_name $RUN_NAME \
-    --save_steps 200 \
+    --save_steps 1000 \
     --save_strategy steps \
     --log_level info \
     --save_only_model true"
@@ -86,7 +86,7 @@ sco acp jobs create \
 --container-image-url "$CONTAINTER" \
 --storage-mount "$MOUNT" \
 --training-framework pytorch \
---worker-spec "${DEVICE}.${GPUS}.${CPU}.${MEM}g" \
+--worker-spec "N6lS.Iu.I80.8.64c1024g" \
 --worker-nodes "$nodes" \
 --job-name "affect_r1_sft_baseline" \
 --command "$COMMAND"

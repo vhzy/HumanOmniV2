@@ -88,7 +88,7 @@ from dataclasses import dataclass
 @dataclass
 class SFTScriptArguments(ScriptArguments):
     image_root: str = field(default=None, metadata={"help": "The root directory of the image."})
-    use_audio_in_video: bool = field(default=True)
+    use_audio_in_video: bool = field(default=False)
 
 @dataclass
 class SFTModelConfig(ModelConfig):
@@ -222,7 +222,7 @@ class LazySupervisedDataset(Dataset):
             subtitle_prompt = f"\nThe subtitle of this video is: <Subtitle>{subtitle.strip()}</Subtitle>."
 
         text_prompt =  f"{subtitle_prompt}\n{question}\n" + self.TYPE_TEMPLATE[example['problem_type']]
-        if use_audio_in_video:
+        if True:
             if isinstance(example['path'], str):
                 # 优先使用独立的音频文件（如果存在 audio_path 字段），避免从视频提取
                 has_separate_audio = 'audio_path' in example and example['audio_path']
@@ -368,11 +368,10 @@ class LazySupervisedDataset(Dataset):
        
         messages  = self._make_conversation_image_and_video(source, use_audio_in_video=self.script_args.use_audio_in_video)
         
-        # 关键：如果有独立音频文件，不要让 process_mm_info 尝试从视频提取音频
-        has_separate_audio = 'audio_path' in source and source['audio_path']
-        use_audio_in_video_for_processing = False if has_separate_audio else self.script_args.use_audio_in_video
-        
-        audios, images, videos = process_mm_info(messages, use_audio_in_video=use_audio_in_video_for_processing)
+        # 关键修复：_make_conversation_image_and_video 已经显式添加了 audio 元素
+        # 所以 process_mm_info 始终使用 False，避免重复从视频提取音频
+        # 这样只会处理显式的 {"type": "audio"} 元素
+        audios, images, videos = process_mm_info(messages, use_audio_in_video=False)
 
    
            

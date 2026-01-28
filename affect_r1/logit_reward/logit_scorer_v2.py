@@ -217,8 +217,20 @@ class LogitScorerV2:
         logits_no: torch.Tensor,
         wheel_name: str,
         gt_l1_categories: Set[str],
+        use_neg_contrast: bool = True,
     ) -> torch.Tensor:
-        """计算单个情绪轮内的增益差分"""
+        """
+        计算单个情绪轮内的增益差分
+        
+        Args:
+            logits_with: With-Think 的 logits
+            logits_no: No-Think 的 logits
+            wheel_name: 情绪轮名称
+            gt_l1_categories: GT的L1类别集合
+            use_neg_contrast: 是否使用负样本对比
+                - True (默认): gain = (S_GT_with - S_GT_no) - (S_Neg_with - S_Neg_no) 双路差分
+                - False: gain = S_GT_with - S_GT_no 只看GT变化
+        """
         device = logits_with.device
         all_l1 = self.token_map.get_wheel_level1_categories(wheel_name)
         
@@ -234,6 +246,10 @@ class LogitScorerV2:
         
         s_gt_with = torch.stack(gt_scores_with, dim=-1).mean(dim=-1)
         s_gt_no = torch.stack(gt_scores_no, dim=-1).mean(dim=-1)
+        
+        # 如果不使用负样本对比，直接返回GT差值
+        if not use_neg_contrast:
+            return s_gt_with - s_gt_no
         
         # Neg 类别得分
         neg_l1 = [l1 for l1 in all_l1 if l1 not in gt_l1_categories]
@@ -265,8 +281,19 @@ class LogitScorerV2:
         logits_with: torch.Tensor,
         logits_no: torch.Tensor,
         gt_words: List[str],
+        use_neg_contrast: bool = True,
     ) -> torch.Tensor:
-        """计算多个情绪轮的平均增益"""
+        """
+        计算多个情绪轮的平均增益
+        
+        Args:
+            logits_with: With-Think 的 logits
+            logits_no: No-Think 的 logits
+            gt_words: GT情感词列表
+            use_neg_contrast: 是否使用负样本对比
+                - True (默认): gain = (S_GT_with - S_GT_no) - (S_Neg_with - S_Neg_no)
+                - False: gain = S_GT_with - S_GT_no
+        """
         device = logits_with.device
         
         wheel_to_l1 = self.token_map.find_gt_in_wheels(gt_words)
@@ -276,7 +303,7 @@ class LogitScorerV2:
         
         wheel_gains = []
         for wheel_name, gt_l1_set in wheel_to_l1.items():
-            gain = self.compute_wheel_gain(logits_with, logits_no, wheel_name, gt_l1_set)
+            gain = self.compute_wheel_gain(logits_with, logits_no, wheel_name, gt_l1_set, use_neg_contrast)
             wheel_gains.append(gain)
         
         gains_tensor = torch.stack(wheel_gains, dim=-1)
@@ -288,6 +315,7 @@ class LogitScorerV2:
         logits_no: torch.Tensor,
         gt_categories: List[str],
         all_categories: Optional[List[str]] = None,
+        use_neg_contrast: bool = True,
     ) -> torch.Tensor:
         """
         计算单个位置的增益差分（使用多 wheel 计算）
@@ -299,12 +327,15 @@ class LogitScorerV2:
             logits_no: No-Think 的 logits (batch_size, vocab_size)
             gt_categories: GT 情感词列表
             all_categories: 忽略（保留兼容）
+            use_neg_contrast: 是否使用负样本对比
+                - True (默认): gain = (S_GT_with - S_GT_no) - (S_Neg_with - S_Neg_no)
+                - False: gain = S_GT_with - S_GT_no
         
         Returns:
             gain: (batch_size,)
         """
         # 使用新的多 wheel 计算方式
-        return self.compute_multi_wheel_gain(logits_with, logits_no, gt_categories)
+        return self.compute_multi_wheel_gain(logits_with, logits_no, gt_categories, use_neg_contrast)
     
     def compute_sequence_reward(
         self,
@@ -313,6 +344,7 @@ class LogitScorerV2:
         anchor_mask: torch.Tensor,
         gt_categories: List[str],
         all_categories: Optional[List[str]] = None,
+        use_neg_contrast: bool = True,
     ) -> torch.Tensor:
         """
         计算序列的最终 Reward
@@ -325,6 +357,7 @@ class LogitScorerV2:
             anchor_mask: 锚点 mask (seq_len,)
             gt_categories: GT 情感类别
             all_categories: 所有候选类别
+            use_neg_contrast: 是否使用负样本对比
         
         Returns:
             reward: scalar
@@ -343,6 +376,7 @@ class LogitScorerV2:
                 logits_seq_no[t:t+1],
                 gt_categories,
                 all_categories,
+                use_neg_contrast,
             )
             gains[t] = gain.squeeze()
         

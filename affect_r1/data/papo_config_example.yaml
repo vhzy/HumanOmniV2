@@ -1,0 +1,99 @@
+# ============================================================
+# PAPO (Perception-Aware Policy Optimization) Configuration
+# ============================================================
+#
+# PAPO reduces model hallucinations by encouraging the model to
+# rely on actual multimodal information rather than guessing.
+#
+# Default values are aligned with original PAPO paper:
+# - kl_coef: 0.001 (1e-3) - KL coefficient for perception loss
+# - entropy_coef: 0.03 - Double entropy regularization coefficient  
+# - mask_ratio: 0.6 - Original PAPO uses 60% blackening probability
+# - use_noise: false - Original PAPO sets patches to zeros (black)
+#
+# Three versions are available:
+#   V0: Mask both audio and video simultaneously (simplest)
+#   V1: Mask audio and video separately (dual-stream)
+#   V2: Matrix-guided fine-grained routing (most sophisticated)
+#
+# ============================================================
+
+# -------------------- V0 Configuration --------------------
+# V0: Mask both modalities together
+# Use this for initial experiments
+papo_v0:
+  enabled: true
+  version: "v0"
+  mask_ratio: 0.9        # Original PAPO: 60% blackening probability
+  use_noise: false       # Original PAPO: sets to zeros (black), NOT noise
+  kl_coef: 0.001         # Original PAPO: kl_prcp_coef = 1e-3
+  entropy_coef: 0.03     # Original PAPO: aug_entropy_loss_coef = 0.03
+  kl_penalty: "kl"       # KL penalty type: "kl", "abs", "mse", "low_var_kl"
+
+# -------------------- V1 Configuration --------------------
+# V1: Mask visual and audio separately
+# Use this to separately track visual vs audio perception
+papo_v1:
+  enabled: true
+  version: "v1"
+  mask_ratio: 0.9        # Original PAPO: 60%
+  use_noise: false       # Original PAPO: zeros
+  kl_coef: 0.001         # Original PAPO: 1e-3
+  entropy_coef: 0.03     # Original PAPO: 0.03
+  kl_penalty: "kl"
+
+# -------------------- V2 Configuration --------------------
+# V2: Matrix-guided fine-grained routing
+# Use this with Stage 2 similarity matrices for best results
+papo_v2:
+  enabled: true
+  version: "v2"
+  mask_ratio: 0.9        # Original PAPO: 60%
+  use_noise: false       # Original PAPO: zeros
+  kl_coef: 0.001         # Original PAPO: 1e-3
+  entropy_coef: 0.03     # Original PAPO: 0.03
+  kl_penalty: "kl"
+  routing_threshold: 0.5  # Threshold for modality routing (V2 only)
+
+# ============================================================
+# How to Use in Training Script
+# ============================================================
+#
+# Option 1: Pass via args in grpo_qwenomni.py
+#
+#   script_args.papo_config = {
+#       "enabled": True,
+#       "version": "v1",  # or "v0", "v2"
+#       "mask_ratio": 0.9,
+#       "kl_coef": 0.01,
+#       "entropy_coef": 0.03,
+#   }
+#
+# Option 2: Set via environment variables
+#
+#   export PAPO_ENABLED=1
+#   export PAPO_VERSION=v1
+#   export PAPO_MASK_RATIO=0.9
+#   export PAPO_KL_COEF=0.01
+#
+# ============================================================
+# Version Selection Guide
+# ============================================================
+#
+# V0 (Simplest):
+#   - 1 additional forward pass
+#   - Good for initial experiments
+#   - Reduces overall hallucination
+#
+# V1 (Balanced):
+#   - 2 additional forward passes
+#   - Separately tracks visual vs audio perception
+#   - Provides more detailed metrics
+#
+# V2 (Most Sophisticated):
+#   - 2 additional forward passes
+#   - Uses similarity matrices from Stage 2 rubric rewards
+#   - Only applies KL loss to tokens truly dependent on each modality
+#   - Requires rubric_perc_reward to compute similarity matrices
+#
+# ============================================================

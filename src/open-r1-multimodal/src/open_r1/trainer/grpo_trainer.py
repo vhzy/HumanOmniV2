@@ -68,6 +68,14 @@ if is_wandb_available():
 from open_r1.vlm_modules.vlm_module import VLMBaseModule
 
 # Logit-based reward (optional)
+# 动态添加 affect_r1 的父目录到 sys.path（解决 torchrun 子进程不继承 PYTHONPATH 的问题）
+# 注意：需要添加 affect_r1 的父目录，这样 Python 才能找到 affect_r1 包
+import sys
+import os as _os
+_affect_r1_parent = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "../../../../.."))  # HumanOmniV2 目录
+if _affect_r1_parent not in sys.path:
+    sys.path.insert(0, _affect_r1_parent)
+
 try:
     from affect_r1.logit_reward import (
         LogitRewardConfig,
@@ -77,6 +85,25 @@ try:
     LOGIT_REWARD_AVAILABLE = True
 except ImportError:
     LOGIT_REWARD_AVAILABLE = False
+
+# PAPO (Perception-Aware Policy Optimization) support
+try:
+    from affect_r1.papo_utils import (
+        PAPOConfig,
+        PAPOVersion,
+        mask_all_multimodal,
+        mask_visual_inputs,
+        mask_audio_inputs,
+        compute_papo_loss_v0,
+        compute_papo_loss_v1,
+        compute_papo_loss_v2,
+        compute_modality_routing_mask,
+        sentence_mask_to_token_mask,
+    )
+    PAPO_AVAILABLE = True
+except ImportError:
+    PAPO_AVAILABLE = False
+    PAPOConfig = None
 
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
@@ -540,6 +567,7 @@ class VLMGRPOTrainer(Trainer):
             min_p=self.min_p,
             repetition_penalty=self.repetition_penalty,
             cache_implementation=args.cache_implementation,
+            renormalize_logits=True,  # 防止 softmax 溢出导致 inf/nan
         )
         if hasattr(self.vlm_module, "get_eos_token_id"):  # For InternVL
             self.generation_config.eos_token_id = self.vlm_module.get_eos_token_id(processing_class)
@@ -667,6 +695,8 @@ class VLMGRPOTrainer(Trainer):
         # Now configured via reward_funcs: logit_reward.coherence, logit_reward.perception
         self.logit_reward_computer = None
         self.logit_reward_weights = {}  # {'coherence': weight, 'perception': weight}
+        self.logit_reward_scale_method = "tanh"  # 'tanh' or 'clip'
+        self.logit_reward_use_neg_contrast = True  # 默认值
         
         # Get logit_reward_config from args (set by grpo_qwenomni.py)
         logit_reward_config = getattr(args, 'logit_reward_config', {})
@@ -687,15 +717,19 @@ class VLMGRPOTrainer(Trainer):
                 # Parse logit_reward_config
                 # coherence weight -> use_coherence_reward and its weight
                 # perception weight -> use_perception_reward and its weight
-                self.logit_reward_weights = logit_reward_config.copy()
+                self.logit_reward_weights = {k: v for k, v in logit_reward_config.items() if k not in ['scale_method']}
+                self.logit_reward_scale_method = logit_reward_config.get('scale_method', 'tanh')
                 
                 tokenizer = getattr(processing_class, 'tokenizer', processing_class)
+                # 解析 use_neg_contrast 参数
+                self.logit_reward_use_neg_contrast = str(getattr(args, 'logit_reward_use_neg_contrast', 'true')).lower() in ('true', '1', 'yes')
                 logit_config = LogitRewardConfig(
                     use_coherence_reward='coherence' in logit_reward_config,
                     use_perception_reward='perception' in logit_reward_config,
                     alpha=1.0,  # 内部不再加权，权重在 grpo_trainer 中通过 reward_weights 统一应用
                     beta=1.0,   # 内部不再加权，权重在 grpo_trainer 中通过 reward_weights 统一应用
                     normalize_rewards=getattr(args, 'logit_reward_normalize', False),
+                    use_neg_contrast=self.logit_reward_use_neg_contrast,
                 )
                 self.logit_reward_computer = create_logit_reward_computer(
                     tokenizer=tokenizer,
@@ -705,6 +739,33 @@ class VLMGRPOTrainer(Trainer):
                 print(f"[LogitReward] Initialized with unified config:")
                 print(f"  - coherence: {'enabled' if 'coherence' in logit_reward_config else 'disabled'}, weight={logit_reward_config.get('coherence', 0.0)}")
                 print(f"  - perception: {'enabled' if 'perception' in logit_reward_config else 'disabled'}, weight={logit_reward_config.get('perception', 0.0)}")
+                print(f"  - scale_method: {self.logit_reward_scale_method}")
+                print(f"  - use_neg_contrast: {logit_config.use_neg_contrast} (raw arg value: {getattr(args, 'logit_reward_use_neg_contrast', 'NOT_FOUND')})")
+                if not logit_config.use_neg_contrast:
+                    print(f"  - reward_scaling: raw_reward / 5.0 → {self.logit_reward_scale_method}()")
+
+        # Initialize PAPO (Perception-Aware Policy Optimization)
+        # Get PAPO config from args (set by grpo_qwenomni.py or config file)
+        papo_config = getattr(args, 'papo_config', {})
+        self.use_papo = papo_config.get('enabled', False) if papo_config else False
+        
+        print(f"[PAPO DEBUG] papo_config: {papo_config}")
+        print(f"[PAPO DEBUG] use_papo: {self.use_papo}")
+        print(f"[PAPO DEBUG] PAPO_AVAILABLE: {PAPO_AVAILABLE}")
+        
+        if self.use_papo:
+            if not PAPO_AVAILABLE:
+                warnings.warn(
+                    "PAPO is enabled but papo_utils module is not available. "
+                    "Please ensure affect_r1.papo_utils is in PYTHONPATH."
+                )
+                self.use_papo = False
+                self.papo_config = None
+            else:
+                self.papo_config = PAPOConfig.from_dict(papo_config)
+                print(f"[PAPO] Initialized: {self.papo_config}")
+        else:
+            self.papo_config = None
 
     def _enable_gradient_checkpointing(self, model: PreTrainedModel, args: GRPOConfig) -> PreTrainedModel:
         """Enables gradient checkpointing for the model."""
@@ -791,7 +852,6 @@ class VLMGRPOTrainer(Trainer):
         # print(inputs)
         prompts = [x["prompt"] for x in inputs]
         prompts_text = self.vlm_module.prepare_prompt(self.processing_class, inputs)[0]
-        # print(f"[DEBUG] Rank {self.accelerator.process_index}: len(inputs)={len(inputs)}, len(prompts_text)={len(prompts_text)}")
         use_audio_in_video = inputs[0].get("use_audio_in_video", False)
         # print(prompts_text)
         images, videos, audios = [], [], []
@@ -807,7 +867,8 @@ class VLMGRPOTrainer(Trainer):
         if len(images) == 0: images = None
         if len(audios) == 0: audios = None
         if len(videos) == 0: videos = None
-    
+        # 在调用 Processor 之前
+
 
         prompt_inputs = self.vlm_module.prepare_model_inputs(
             self.processing_class,
@@ -819,7 +880,7 @@ class VLMGRPOTrainer(Trainer):
             padding=True,
             padding_side="left",
             add_special_tokens=False,
-            use_audio_in_video=use_audio_in_video,
+            use_audio_in_video=False,
         )
         # Processor 未显式返回 audio_feature_lengths 时，仅在存在音频特征的前提下，
         # 借助 feature_attention_mask 推导补全，避免无音频样本产生伪造的长度信息
@@ -968,6 +1029,10 @@ class VLMGRPOTrainer(Trainer):
         # No need to duplicate prompts as we're not generating multiple completions per prompt
 
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
+        
+        # For PAPO V2: collect similarity matrices from reward functions
+        papo_v2_sim_results = None
+        
         for i, (reward_func, reward_processing_class) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes)
         ):
@@ -991,9 +1056,42 @@ class VLMGRPOTrainer(Trainer):
                         # No need to duplicate prompts as we're not generating multiple completions per prompt
                         # reward_kwargs[key].extend([example[key]] * self.num_generations)
                         reward_kwargs[key].extend([example[key]])
+                
                 output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
+                
+                # Check if reward function returned similarity matrices (for PAPO V2)
+                # rubric_perc_reward_with_matrices returns (rewards, sim_results)
+                if isinstance(output_reward_func, tuple) and len(output_reward_func) == 2:
+                    output_reward_func, sim_results = output_reward_func
+                    # Store sim_results for PAPO V2 (only from the perception reward)
+                    if self.use_papo and self.papo_config and self.papo_config.version == PAPOVersion.V2:
+                        func_name = reward_func.__name__
+                        if 'perc' in func_name.lower() or 'perception' in func_name.lower():
+                            papo_v2_sim_results = sim_results
+                            print(f"[PAPO V2] Captured similarity matrices from {func_name}, count: {len(sim_results)}")
+                
                 output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+
+        # 可选：格式守门，format 错则该样本奖励全归零
+        if getattr(self.args, "format_gate_all", False):
+            format_cols = [idx for idx, f in enumerate(self.reward_funcs) if getattr(f, "__name__", "") == "format_reward"]
+            if len(format_cols) > 0:
+                format_ok = torch.ones(len(prompts), device=device, dtype=torch.bool)
+                for col in format_cols:
+                    format_ok = format_ok & (rewards_per_func[:, col] > 0.5)
+                rewards_per_func = torch.where(
+                    format_ok.unsqueeze(1),
+                    rewards_per_func,
+                    torch.zeros_like(rewards_per_func),
+                )
+
+        # 可选：关闭 stage2 奖励（format / perception / coherence），但仍保留 PAPO V2 的相似度路由
+        if getattr(self.args, "disable_stage2_rewards", False):
+            stage2_names = {"rubric_perc_reward_with_matrices", "rubric_perc_reward", "rubric_coh_reward"}
+            for idx, reward_func in enumerate(self.reward_funcs):
+                if getattr(reward_func, "__name__", "") in stage2_names:
+                    rewards_per_func[:, idx] = 0
 
         # markov
         if rewards_per_func.size(1) ==4 and self.markov_reward: # format, acc, reason, evi
@@ -1092,26 +1190,52 @@ class VLMGRPOTrainer(Trainer):
                 
                 # 使用统一的权重配置，手动加权各个组件
                 # logit_reward_weights: {'coherence': weight, 'perception': weight}
-                logit_total_reward = torch.zeros_like(rewards)
+                # 重要：logit_rewards_dict 是用本地数据计算的，维度是 (local_batch_size,)
+                # 需要用本地维度初始化 logit_total_reward，然后 gather 后再加到 rewards
+                local_batch_size = logit_rewards_dict["coherence"].size(0) if "coherence" in logit_rewards_dict else logit_rewards_dict["perception"].size(0)
+                logit_total_reward = torch.zeros(local_batch_size, device=device)
                 
-                # 使用 tanh 平滑限制 logit reward 范围到 [-1, 1]
+                # 根据 scale_method 选择缩放方式
+                # tanh: 平滑映射到 [-1, 1]
+                # clip: 硬截断到 [-2, 2]
+                # 特别处理：当 use_neg_contrast=False 时，先除以 5 再应用 tanh
+                def scale_reward(raw_reward, method, use_neg_contrast):
+                    # 如果不使用 neg contrast，先缩小 5 倍
+                    # if not use_neg_contrast:
+                    #     if raw_reward < 0:
+                    #         raw_reward = raw_reward / 2.0
+                    
+                    if method == 'clip':
+                        return torch.clamp(raw_reward, -5.0, 5.0)
+                    else:  # 默认 tanh
+                        return torch.tanh(raw_reward)
+                
+                scale_method = self.logit_reward_scale_method
+                use_neg_contrast = getattr(self, 'logit_reward_use_neg_contrast', True)
+                
                 if 'coherence' in self.logit_reward_weights:
                     coherence_weight = self.logit_reward_weights['coherence']
                     coherence_raw = logit_rewards_dict["coherence"]
-                    coherence_scaled = torch.tanh(coherence_raw)  # 平滑映射到 [-1, 1]
+                    coherence_scaled = scale_reward(coherence_raw, scale_method, use_neg_contrast)
                     logit_total_reward = logit_total_reward + coherence_weight * coherence_scaled
-                    print(f"[LogitReward DEBUG] coherence: weight={coherence_weight}, raw_mean={coherence_raw.mean().item():.4f}, tanh_mean={coherence_scaled.mean().item():.4f}")
+                    scaling_info = f"/5 then {scale_method}" if not use_neg_contrast else scale_method
+                    print(f"[LogitReward DEBUG] coherence: weight={coherence_weight}, raw_mean={coherence_raw.mean().item():.4f}, {scaling_info}_mean={coherence_scaled.mean().item():.4f}")
                 
                 if 'perception' in self.logit_reward_weights:
                     perception_weight = self.logit_reward_weights['perception']
                     perception_raw = logit_rewards_dict["perception"]
-                    perception_scaled = torch.tanh(perception_raw)  # 平滑映射到 [-1, 1]
+                    perception_scaled = scale_reward(perception_raw, scale_method, use_neg_contrast)
                     logit_total_reward = logit_total_reward + perception_weight * perception_scaled
-                    print(f"[LogitReward DEBUG] perception: weight={perception_weight}, raw_mean={perception_raw.mean().item():.4f}, tanh_mean={perception_scaled.mean().item():.4f}")
+                    scaling_info = f"/5 then {scale_method}" if not use_neg_contrast else scale_method
+                    print(f"[LogitReward DEBUG] perception: weight={perception_weight}, raw_mean={perception_raw.mean().item():.4f}, {scaling_info}_mean={perception_scaled.mean().item():.4f}")
                 
                 # 将加权后的 logit reward 添加到 rewards 中
+                # 重要：先 gather logit_total_reward 以匹配 rewards 的维度
+                # rewards 已经是 gathered 后的全局数据，维度是 (N * num_gpus,)
+                # logit_total_reward 是本地数据，维度是 (local_batch_size,)
+                logit_total_reward = self.accelerator.gather(logit_total_reward)
                 rewards = rewards + logit_total_reward
-                print(f"[LogitReward DEBUG] Added logit reward to rewards, total_mean: {logit_total_reward.mean().item():.4f}")
+                print(f"[LogitReward DEBUG] Added logit reward to rewards (after gather), local_batch={local_batch_size}, gathered_size={logit_total_reward.size(0)}, total_mean: {logit_total_reward.mean().item():.4f}")
                 
             except Exception as e:
                 import traceback
@@ -1163,15 +1287,27 @@ class VLMGRPOTrainer(Trainer):
         
         # Log logit-based rewards if computed
         if logit_rewards_dict is not None:
-            self._metrics[mode]["rewards/logit_coherence"].append(
-                logit_rewards_dict["coherence"].mean().item()
-            )
-            self._metrics[mode]["rewards/logit_perception"].append(
-                logit_rewards_dict["perception"].mean().item()
-            )
-            self._metrics[mode]["rewards/logit_total"].append(
-                logit_rewards_dict["total"].mean().item()
-            )
+            if "coherence" in logit_rewards_dict:
+                self._metrics[mode]["rewards/logit_coherence"].append(
+                    logit_rewards_dict["coherence"].mean().item()
+                )
+            if "perception" in logit_rewards_dict:
+                self._metrics[mode]["rewards/logit_perception"].append(
+                    logit_rewards_dict["perception"].mean().item()
+                )
+            if "total" in logit_rewards_dict:
+                self._metrics[mode]["rewards/logit_total"].append(
+                    logit_rewards_dict["total"].mean().item()
+                )
+            # 同时记录两种 use_neg_contrast 模式的 coherence reward 曲线（用于对比）
+            if "coherence_contrast" in logit_rewards_dict:
+                self._metrics[mode]["rewards/logit_coherence_contrast"].append(
+                    logit_rewards_dict["coherence_contrast"].mean().item()
+                )
+            if "coherence_no_contrast" in logit_rewards_dict:
+                self._metrics[mode]["rewards/logit_coherence_no_contrast"].append(
+                    logit_rewards_dict["coherence_no_contrast"].mean().item()
+                )
 
         if self.log_completions and self.state.global_step % self.args.logging_steps == 0:
             # Gather across processes so lengths对齐
@@ -1208,6 +1344,129 @@ class VLMGRPOTrainer(Trainer):
                 #     df = pd.DataFrame(table)
                 #     wandb.log({"completions": wandb.Table(dataframe=df)})
 
+        # ===================== PAPO: Compute masked forward passes =====================
+        papo_data = {}
+        if self.use_papo and self.papo_config is not None:
+            try:
+                with torch.no_grad():
+                    prompt_length = prompt_ids.size(1)
+                    
+                    if self.papo_config.version == PAPOVersion.V0:
+                        # V0: Mask both audio and video simultaneously
+                        masked_inputs = mask_all_multimodal(
+                            multimodal_inputs, 
+                            mask_ratio=self.papo_config.mask_ratio,
+                            noise=self.papo_config.use_noise
+                        )
+                        masked_per_token_logps = self._get_per_token_logps(
+                            self.model, prompt_completion_ids, attention_mask, **masked_inputs
+                        )
+                        masked_per_token_logps = masked_per_token_logps[:, prompt_length - 1:]
+                        papo_data["masked_per_token_logps"] = masked_per_token_logps
+                        print(f"[PAPO V0] Computed masked logps, shape: {masked_per_token_logps.shape}")
+                        
+                    elif self.papo_config.version == PAPOVersion.V1:
+                        # V1: Mask visual and audio separately
+                        # No visual input
+                        no_v_inputs = mask_visual_inputs(
+                            multimodal_inputs,
+                            mask_ratio=self.papo_config.mask_ratio,
+                            noise=self.papo_config.use_noise
+                        )
+                        no_v_per_token_logps = self._get_per_token_logps(
+                            self.model, prompt_completion_ids, attention_mask, **no_v_inputs
+                        )
+                        no_v_per_token_logps = no_v_per_token_logps[:, prompt_length - 1:]
+                        papo_data["no_v_per_token_logps"] = no_v_per_token_logps
+                        
+                        # No audio input
+                        no_a_inputs = mask_audio_inputs(
+                            multimodal_inputs,
+                            mask_ratio=self.papo_config.mask_ratio,
+                            noise=self.papo_config.use_noise
+                        )
+                        no_a_per_token_logps = self._get_per_token_logps(
+                            self.model, prompt_completion_ids, attention_mask, **no_a_inputs
+                        )
+                        no_a_per_token_logps = no_a_per_token_logps[:, prompt_length - 1:]
+                        papo_data["no_a_per_token_logps"] = no_a_per_token_logps
+                        print(f"[PAPO V1] Computed no_v and no_a logps")
+                        
+                    elif self.papo_config.version == PAPOVersion.V2:
+                        # V2: Matrix-guided fine-grained PAPO
+                        # First compute the masked logps (same as V1)
+                        no_v_inputs = mask_visual_inputs(
+                            multimodal_inputs,
+                            mask_ratio=self.papo_config.mask_ratio,
+                            noise=self.papo_config.use_noise
+                        )
+                        no_v_per_token_logps = self._get_per_token_logps(
+                            self.model, prompt_completion_ids, attention_mask, **no_v_inputs
+                        )
+                        no_v_per_token_logps = no_v_per_token_logps[:, prompt_length - 1:]
+                        papo_data["no_v_per_token_logps"] = no_v_per_token_logps
+                        
+                        no_a_inputs = mask_audio_inputs(
+                            multimodal_inputs,
+                            mask_ratio=self.papo_config.mask_ratio,
+                            noise=self.papo_config.use_noise
+                        )
+                        no_a_per_token_logps = self._get_per_token_logps(
+                            self.model, prompt_completion_ids, attention_mask, **no_a_inputs
+                        )
+                        no_a_per_token_logps = no_a_per_token_logps[:, prompt_length - 1:]
+                        papo_data["no_a_per_token_logps"] = no_a_per_token_logps
+                        
+                        # V2 routing masks will be computed in compute_loss using sim_matrices from reward
+                        # For now, store completions for sentence extraction
+                        papo_data["completions_text"] = completions_text
+                        print(f"[PAPO V2] Computed no_v and no_a logps (routing masks will be in compute_loss)")
+                        
+            except Exception as e:
+                import traceback
+                print(f"[PAPO ERROR] Failed to compute masked logps: {e}")
+                traceback.print_exc()
+                papo_data = {}
+        # ===================== END PAPO =====================
+        
+        # ===================== PAPO V2: Convert sim_results to token masks =====================
+        sim_matrices = {}
+        if self.use_papo and self.papo_config and self.papo_config.version == PAPOVersion.V2:
+            if papo_v2_sim_results is not None and len(papo_v2_sim_results) > 0:
+                try:
+                    # Import the conversion function from affect_reward
+                    from affect_reward import compute_modality_token_masks
+                    
+                    token_masks_dict = compute_modality_token_masks(
+                        sim_results=papo_v2_sim_results,
+                        completion_ids=completion_ids,
+                        tokenizer=self.processing_class.tokenizer,
+                        threshold=self.papo_config.routing_threshold,
+                    )
+                    
+                    sim_matrices = {
+                        'visual_token_mask': token_masks_dict['visual_token_mask'],
+                        'audio_token_mask': token_masks_dict['audio_token_mask'],
+                    }
+                    
+                    print(f"[PAPO V2] Converted sim_results to token masks, shapes: "
+                          f"visual={sim_matrices['visual_token_mask'].shape}, "
+                          f"audio={sim_matrices['audio_token_mask'].shape}")
+                    
+                    # Log routing statistics
+                    visual_ratio = sim_matrices['visual_token_mask'].sum() / sim_matrices['visual_token_mask'].numel()
+                    audio_ratio = sim_matrices['audio_token_mask'].sum() / sim_matrices['audio_token_mask'].numel()
+                    print(f"[PAPO V2] Token routing: visual={visual_ratio:.2%}, audio={audio_ratio:.2%}")
+                    
+                except Exception as e:
+                    import traceback
+                    print(f"[PAPO V2 ERROR] Failed to convert sim_results to token masks: {e}")
+                    traceback.print_exc()
+                    sim_matrices = {}
+            else:
+                print(f"[PAPO V2 WARNING] No sim_results available, will fallback to V1 behavior")
+        # ===================== END PAPO V2 =====================
+
         return {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
@@ -1217,7 +1476,9 @@ class VLMGRPOTrainer(Trainer):
             "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
             "multimodal_inputs": multimodal_inputs,
-            "patial_advantages": patial_advantages
+            "patial_advantages": patial_advantages,
+            "papo_data": papo_data,
+            "sim_matrices": sim_matrices,  # Add sim_matrices for PAPO V2
         }
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -1295,6 +1556,87 @@ class VLMGRPOTrainer(Trainer):
         is_clipped = (per_token_loss2 < per_token_loss1).float()
         clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
         self._metrics[mode]["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
+
+        # ===================== PAPO Loss =====================
+        if self.use_papo and self.papo_config is not None:
+            papo_data = inputs.get("papo_data", {})
+            
+            if papo_data:
+                try:
+                    if self.papo_config.version == PAPOVersion.V0:
+                        # V0: Both modalities masked together
+                        masked_logps = papo_data.get("masked_per_token_logps")
+                        if masked_logps is not None:
+                            papo_loss, papo_metrics = compute_papo_loss_v0(
+                                log_probs_full=per_token_logps,
+                                log_probs_masked=masked_logps,
+                                completion_mask=completion_mask,
+                                kl_coef=self.papo_config.kl_coef,
+                                entropy_coef=self.papo_config.entropy_coef,
+                                kl_penalty=self.papo_config.kl_penalty,
+                            )
+                            loss = loss + papo_loss
+                            for k, v in papo_metrics.items():
+                                self._metrics[mode][k].append(v)
+                                
+                    elif self.papo_config.version == PAPOVersion.V1:
+                        # V1: Separate visual and audio masking
+                        no_v_logps = papo_data.get("no_v_per_token_logps")
+                        no_a_logps = papo_data.get("no_a_per_token_logps")
+                        if no_v_logps is not None and no_a_logps is not None:
+                            papo_loss, papo_metrics = compute_papo_loss_v1(
+                                log_probs_full=per_token_logps,
+                                log_probs_no_v=no_v_logps,
+                                log_probs_no_a=no_a_logps,
+                                completion_mask=completion_mask,
+                                kl_coef=self.papo_config.kl_coef,
+                                entropy_coef=self.papo_config.entropy_coef,
+                                kl_penalty=self.papo_config.kl_penalty,
+                            )
+                            loss = loss + papo_loss
+                            for k, v in papo_metrics.items():
+                                self._metrics[mode][k].append(v)
+                                
+                    elif self.papo_config.version == PAPOVersion.V2:
+                        # V2: Matrix-guided fine-grained PAPO
+                        no_v_logps = papo_data.get("no_v_per_token_logps")
+                        no_a_logps = papo_data.get("no_a_per_token_logps")
+                        
+                        # Get similarity matrices from inputs (computed by reward functions)
+                        sim_matrices = inputs.get("sim_matrices", {})
+                        
+                        if no_v_logps is not None and no_a_logps is not None:
+                            # If we have similarity matrices, use them for routing
+                            if sim_matrices:
+                                visual_token_mask = sim_matrices.get("visual_token_mask", 
+                                    torch.ones_like(completion_mask))
+                                audio_token_mask = sim_matrices.get("audio_token_mask",
+                                    torch.ones_like(completion_mask))
+                            else:
+                                # Fallback: use all tokens (same as V1)
+                                visual_token_mask = torch.ones_like(completion_mask)
+                                audio_token_mask = torch.ones_like(completion_mask)
+                            
+                            papo_loss, papo_metrics = compute_papo_loss_v2(
+                                log_probs_full=per_token_logps,
+                                log_probs_no_v=no_v_logps,
+                                log_probs_no_a=no_a_logps,
+                                completion_mask=completion_mask,
+                                visual_token_mask=visual_token_mask,
+                                audio_token_mask=audio_token_mask,
+                                kl_coef=self.papo_config.kl_coef,
+                                entropy_coef=self.papo_config.entropy_coef,
+                                kl_penalty=self.papo_config.kl_penalty,
+                            )
+                            loss = loss + papo_loss
+                            for k, v in papo_metrics.items():
+                                self._metrics[mode][k].append(v)
+                                
+                except Exception as e:
+                    import traceback
+                    print(f"[PAPO ERROR] Failed to compute PAPO loss: {e}")
+                    traceback.print_exc()
+        # ===================== END PAPO Loss =====================
 
         return loss
 

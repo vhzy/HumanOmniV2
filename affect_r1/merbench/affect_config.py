@@ -4,7 +4,11 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 
-from .config_utils import DATASET_SUBDIRS, update_affectgpt_paths
+# 兼容直接运行和作为包导入两种方式
+try:
+    from .config_utils import DATASET_SUBDIRS, update_affectgpt_paths
+except ImportError:
+    from config_utils import DATASET_SUBDIRS, update_affectgpt_paths
 
 
 DEFAULT_LLM_PATHS = {

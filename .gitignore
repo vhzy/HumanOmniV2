@@ -25,3 +25,27 @@ assets/*.webp
 *.pth
 *.pt
 *.bin
+
+# 通用文件过滤
+*.jsonl
+*.backup
+*.md
+*.pdf
+*.png
+*.svg
+*.jpg
+*.mp4
+*.txt
+
+# IDE/编辑器配置
+.vscode/
+
+# 数据集和输出目录
+affect_r1/data/CA-MER/
+affect_r1/data/pope_dataset/
+affect_r1/data/rl/
+affect_r1/merbench/logit_gain_eval/
+affect_r1/output2/
+fig/
+sample_selection/
+video/

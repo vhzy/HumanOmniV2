@@ -3,10 +3,10 @@ set -euo pipefail
 
 # AFFECTGPT_ROOT=/mnt/afs/hanzhiyuan/code/AffectGPT/AffectGPT
 DATASET_ROOT=/mnt/afs/hanzhiyuan/datasets
-OUTPUT_ROOT=/mnt/afs/hanzhiyuan/code/HumanOmniV2/affect_r1/output2/affect_r1_grpo_logit6/inference
-RUN_NAME=merbench_baseline #merbench_baseline 3262merbench_cf_old_10_early_answer
-CKPT_NAME=checkpoint-3262
-DATASETS=(OVMERDPlus MER2023 MER2024 MELD IEMOCAPFour CMUMOSI  ) #OVMERDPlus MER2023 MER2024 MELD IEMOCAPFour CMUMOSI CMUMOSEI SIMS SIMSV2 MER2025
+OUTPUT_ROOT=/mnt/afs/hanzhiyuan/code/HumanOmniV2/affect_r1/output2/affect_r1_grpo_logit2/inference-cf
+RUN_NAME=merbench_cf_old_10_early_answer
+CKPT_NAME=checkpoint-3000
+DATASETS=( OVMERDPlus MER2023 MER2024 MELD IEMOCAPFour CMUMOSI CMUMOSEI SIMS SIMSV2 ) #OVMERDPlus MER2023 MER2024 MELD IEMOCAPFour CMUMOSI CMUMOSEI SIMS SIMSV2 MER2025
 
 for ds in "${DATASETS[@]}"; do
   ds_lower="${ds,,}"

@@ -142,6 +142,16 @@ _TEXT_EMB_CACHE_SIZE = 2048
 _TASK_INSTRUCT = os.getenv("RUBRIC_INSTRUCT", "Given a clause query, calculate the similarity between this clause and the key clue.")
 _DEBUG_MODE = os.getenv("RUBRIC_DEBUG", "0") == "1"
 
+# Perception reward 计算中的相似度阈值，与 PAPO routing threshold 保持一致
+# 可通过 set_score_threshold() 函数设置，默认值 0.5
+_SCORE_THRESHOLD = 0.5
+
+def set_score_threshold(threshold: float):
+    """设置 perception reward 计算中的相似度阈值，与 PAPO routing threshold 保持一致。"""
+    global _SCORE_THRESHOLD
+    _SCORE_THRESHOLD = threshold
+    print(f"[affect_reward] Score threshold set to {threshold}")
+
 
 def _last_token_pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
     """
@@ -312,6 +322,10 @@ def _column_max_scores(pred_embs: torch.Tensor, gt_embs: torch.Tensor, return_si
     """
     矩阵列最大相似度并做 ReLU 阈值缩放。
     
+    阈值使用模块级变量 _SCORE_THRESHOLD（默认 0.5），可通过 set_score_threshold() 设置。
+    缩放公式: scores = relu(max_sim - threshold) * scale
+    其中 scale = 1 / (1 - threshold)，使得当 max_sim=1 时 score=1。
+    
     Args:
         pred_embs: 预测句子的 embedding (Ns, D)
         gt_embs: GT 线索的 embedding (Ng, D)
@@ -327,7 +341,10 @@ def _column_max_scores(pred_embs: torch.Tensor, gt_embs: torch.Tensor, return_si
     gt = F.normalize(gt_embs, p=2, dim=1)
     sims = pred @ gt.T  # (Ns, Ng)
     max_per_gt = sims.max(dim=0).values
-    scores = torch.relu(max_per_gt - 0.5) * 2.0
+    # 使用模块级阈值，缩放因子 = 1/(1-threshold) 使得 max_sim=1 时 score=1
+    threshold = _SCORE_THRESHOLD
+    scale = 1.0 / (1.0 - threshold) if threshold < 1.0 else 2.0
+    scores = torch.relu(max_per_gt - threshold) * scale
     if return_sims:
         return scores, sims
     return scores, None
@@ -482,3 +499,202 @@ def rubric_coh_reward(completions, **kwargs):
                 print("="*80 + "\n")
 
     return rewards
+
+
+# ========================== PAPO V2 Support: Similarity Matrices ==========================
+
+def compute_similarity_matrices_for_papo(completions, **kwargs):
+    """
+    Compute similarity matrices for PAPO V2 routing.
+    
+    Returns:
+        List of dicts, each containing:
+        - 'sim_matrix_v': (Ns, Ng_v) visual similarity matrix
+        - 'sim_matrix_a': (Ns, Ng_a) audio similarity matrix
+        - 'sentences': list of sentence strings
+        - 'score_v': (Ns,) max visual scores per sentence
+        - 'score_a': (Ns,) max audio scores per sentence
+    """
+    results = []
+    paths = kwargs.get("path") or [None] * len(completions)
+    clues_list = kwargs.get("extracted_clues") or [None] * len(completions)
+    
+    if not isinstance(paths, list):
+        paths = [paths] * len(completions)
+    if not isinstance(clues_list, list):
+        clues_list = [clues_list] * len(completions)
+    
+    for completion, path, clues in zip(completions, paths, clues_list):
+        text = completion[0]["content"]
+        
+        # Extract think text and split into sentences
+        think_text = _extract_think_text(text)
+        sentences = _split_sentences(think_text)
+        if not sentences:
+            sentences = [think_text] if think_text else []
+        
+        # Get embeddings
+        pred_embs = _encode_texts(sentences) if sentences else None
+        rubric = _get_rubric(path, clues or {})
+        
+        result = {
+            'sentences': sentences,
+            'sim_matrix_v': None,
+            'sim_matrix_a': None,
+            'score_v': None,
+            'score_a': None,
+        }
+        
+        if pred_embs is not None:
+            # Visual similarity matrix
+            visual_embs = rubric.get("visual")
+            if visual_embs is not None and visual_embs.numel() > 0:
+                pred = F.normalize(pred_embs.to(device=visual_embs.device, dtype=visual_embs.dtype), p=2, dim=1)
+                gt = F.normalize(visual_embs, p=2, dim=1)
+                sims_v = pred @ gt.T  # (Ns, Ng_v)
+                result['sim_matrix_v'] = sims_v
+                result['score_v'] = sims_v.max(dim=-1).values
+            
+            # Audio similarity matrix
+            audio_embs = rubric.get("audio")
+            if audio_embs is not None and audio_embs.numel() > 0:
+                pred = F.normalize(pred_embs.to(device=audio_embs.device, dtype=audio_embs.dtype), p=2, dim=1)
+                gt = F.normalize(audio_embs, p=2, dim=1)
+                sims_a = pred @ gt.T  # (Ns, Ng_a)
+                result['sim_matrix_a'] = sims_a
+                result['score_a'] = sims_a.max(dim=-1).values
+        
+        results.append(result)
+    
+    return results
+
+
+def compute_modality_token_masks(
+    sim_results: list,
+    completion_ids: torch.Tensor,
+    tokenizer,
+    threshold: float = 0.5,
+):
+    """
+    Compute token-level modality masks for PAPO V2.
+    
+    This function maps sentence-level modality assignments to token-level masks.
+    Uses precise token counts from tokenizer for accurate mapping.
+    
+    Args:
+        sim_results: List of similarity matrix results from compute_similarity_matrices_for_papo
+        completion_ids: Token IDs of completions (B, L)
+        tokenizer: Tokenizer for encoding sentences
+        threshold: Similarity threshold for modality routing
+        
+    Returns:
+        Dict with 'visual_token_mask' and 'audio_token_mask', both (B, L)
+    """
+    batch_size, seq_len = completion_ids.shape
+    device = completion_ids.device
+    
+    visual_masks = []
+    audio_masks = []
+    
+    for b in range(batch_size):
+        if b >= len(sim_results):
+            # No similarity data for this sample
+            visual_masks.append(torch.zeros(seq_len, device=device))
+            audio_masks.append(torch.zeros(seq_len, device=device))
+            continue
+        
+        result = sim_results[b]
+        sentences = result.get('sentences', [])
+        score_v = result.get('score_v')
+        score_a = result.get('score_a')
+        
+        if not sentences or (score_v is None and score_a is None):
+            # No valid data, default to all tokens
+            visual_masks.append(torch.ones(seq_len, device=device))
+            audio_masks.append(torch.ones(seq_len, device=device))
+            continue
+        
+        # Handle None scores and ensure correct device
+        if score_v is None:
+            score_v = torch.full((len(sentences),), float('-inf'), device=device)
+        else:
+            score_v = score_v.to(device)
+        
+        if score_a is None:
+            score_a = torch.full((len(sentences),), float('-inf'), device=device)
+        else:
+            score_a = score_a.to(device)
+        
+        # Compute modality assignment per sentence
+        is_visual = (score_v > threshold) & (score_v > score_a)
+        is_audio = (score_a > threshold) & (score_a > score_v)
+        
+        # === Precise token count mapping ===
+        # Use tokenizer to get exact token count for each sentence
+        sentence_token_counts = []
+        for sent in sentences:
+            # Encode each sentence to get its token count
+            tokens = tokenizer.encode(sent, add_special_tokens=False)
+            sentence_token_counts.append(len(tokens))
+        
+        total_sentence_tokens = sum(sentence_token_counts)
+        
+        # Initialize masks
+        visual_mask = torch.zeros(seq_len, device=device)
+        audio_mask = torch.zeros(seq_len, device=device)
+        
+        if total_sentence_tokens > 0:
+            # Allocate completion tokens proportionally to each sentence's token count
+            current_token = 0
+            for i, token_count in enumerate(sentence_token_counts):
+                if i >= len(is_visual):
+                    break
+                
+                # Calculate token allocation proportionally
+                # token_allocation = seq_len * (token_count / total_sentence_tokens)
+                token_allocation = int(round(seq_len * token_count / total_sentence_tokens))
+                token_start = current_token
+                token_end = min(current_token + token_allocation, seq_len)
+                
+                # Ensure we don't exceed seq_len and handle last sentence
+                if i == len(sentences) - 1:
+                    token_end = seq_len  # Last sentence gets remaining tokens
+                
+                # Set masks for this sentence based on modality
+                if token_start < token_end:
+                    if is_visual[i]:
+                        visual_mask[token_start:token_end] = 1.0
+                    if is_audio[i]:
+                        audio_mask[token_start:token_end] = 1.0
+                
+                current_token = token_end
+        else:
+            # Fallback: equal division if no tokens (shouldn't happen)
+            tokens_per_sentence = seq_len // max(len(sentences), 1)
+            for i, (vis, aud) in enumerate(zip(is_visual, is_audio)):
+                start = i * tokens_per_sentence
+                end = min((i + 1) * tokens_per_sentence, seq_len)
+                if vis:
+                    visual_mask[start:end] = 1.0
+                if aud:
+                    audio_mask[start:end] = 1.0
+        
+        visual_masks.append(visual_mask)
+        audio_masks.append(audio_mask)
+    
+    return {
+        'visual_token_mask': torch.stack(visual_masks, dim=0),
+        'audio_token_mask': torch.stack(audio_masks, dim=0),
+    }
+
+
+def rubric_perc_reward_with_matrices(completions, **kwargs):
+    """
+    Extended version of rubric_perc_reward that also returns similarity matrices.
+    
+    Returns:
+        Tuple of (rewards, sim_results)
+    """
+    rewards = rubric_perc_reward(completions, **kwargs)
+    sim_results = compute_similarity_matrices_for_papo(completions, **kwargs)
+    return rewards, sim_results

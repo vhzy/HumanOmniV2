@@ -1,0 +1,4 @@
+datasets:
+  - json_path: /mnt/afs/hanzhiyuan/code/HumanOmniV2/affect_r1/data/rl_with_extracted_clues_filtered.jsonl
+    sampling_strategy: all
+

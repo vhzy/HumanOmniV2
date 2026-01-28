@@ -3,17 +3,17 @@
 # 提交任务信息
 WORKSPACE=a58d023b-de76-475f-89c2-7e50f7aa3c7a
 # PARTITION=amplarge2
-# PARTITION=h100-share2
+PARTITION=m-train-ocr
 # PARTITION=h100-share3
 # PARTITION=m-train-1
-# PARTITION=m-train-2
+# PARTITION=m-train-1
 # PARTITION=m-train-ocr
-PARTITION=vqalarge2
+# PARTITION=vqalarge2
 CONTAINTER=registry.ms-sc-01.maoshanwangtech.com/lepton-trainingjob/nvidia24.04-ubuntu22.04-py3.10-cuda12.4-cudnn9.1-torch2.3.0-transformerengine1.5:v1.0.0-20241130-nvdia-base-image
 MOUNT=1f29056c-c3f2-11ee-967e-2aea81fd34ba:/mnt/afs2,047443d2-c3f2-11ee-a5f9-9e29792dec2f:/mnt/afs1,ce3b1174-f6eb-11ee-a372-82d352e10aed:/mnt/afs
 
 nodes=1
-GPUS=8
+GPUS=2
 
 if [[ "$PARTITION" == "err-nodes" || "$PARTITION" == "r1-m1" || "$PARTITION" == "r1-m1-large" ]]; then
     DEVICE="N6lS.Iq.I10"
